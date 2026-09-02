@@ -21,7 +21,7 @@ end
 
 local function scrub(s)
 	s = tostring(s or "")
-	s = s:gsub("[\000-\008\011\012\014-\037\127]", "")
+	s = s:gsub("%c", ""):gsub("\127", "")
 	s = s:gsub("\239\187\191", "")
 	s = s:gsub("\226\128\139", "")
 	s = s:gsub("\226\128\140", "")
