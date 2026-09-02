@@ -1,7 +1,7 @@
 {
-	"admin/network/nsclient": {
-		"title": "NS Client",
-		"order": 70,
+	"admin/vpn": {
+		"title": "VPN",
+		"order": 60,
 		"action": {
 			"type": "call",
 			"module": "luci.controller.nsclient",

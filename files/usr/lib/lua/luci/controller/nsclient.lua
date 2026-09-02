@@ -7,12 +7,12 @@ local jsonc = require "luci.jsonc"
 local dispatcher = require "luci.dispatcher"
 
 function index()
-	entry({"admin", "network", "nsclient"}, call("action_index"), _("NS Client"), 70).dependent = false
-	entry({"admin", "network", "nsclient", "status"}, call("action_status")).leaf = true
-	entry({"admin", "network", "nsclient", "login"}, call("action_login")).leaf = true
-	entry({"admin", "network", "nsclient", "connect"}, call("action_connect")).leaf = true
-	entry({"admin", "network", "nsclient", "disconnect"}, call("action_disconnect")).leaf = true
-	entry({"admin", "network", "nsclient", "save"}, call("action_save")).leaf = true
+	entry({"admin", "vpn"}, call("action_index"), "VPN", 60).dependent = false
+	entry({"admin", "vpn", "status"}, call("action_status")).leaf = true
+	entry({"admin", "vpn", "login"}, call("action_login")).leaf = true
+	entry({"admin", "vpn", "connect"}, call("action_connect")).leaf = true
+	entry({"admin", "vpn", "disconnect"}, call("action_disconnect")).leaf = true
+	entry({"admin", "vpn", "save"}, call("action_save")).leaf = true
 end
 
 local function sh_quote(s)
@@ -108,7 +108,7 @@ end
 function action_index()
 	sys.call("/usr/sbin/nsclient sync >/dev/null 2>&1")
 	if apply_url_overrides() then
-		http.redirect(dispatcher.build_url("admin", "network", "nsclient"))
+		http.redirect(dispatcher.build_url("admin", "vpn"))
 		return
 	end
 	luci.template.render("nsclient/main")

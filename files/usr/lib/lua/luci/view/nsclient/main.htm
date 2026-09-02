@@ -19,8 +19,8 @@
 </style>
 
 <div class="cbi-map" id="nsclient-app">
-	<h2 name="content">NS Client</h2>
-	<div class="cbi-map-descr">登录后预选出口节点，再点击连接。按需切换不同区域。</div>
+	<h2 name="content">VPN</h2>
+	<div class="cbi-map-descr">登录后预选出口区域，再点击连接。</div>
 
 	<div id="nsc-status" class="nsc-status nsc-off">正在读取状态…</div>
 	<div id="nsc-msg" class="nsc-msg"></div>
@@ -65,8 +65,6 @@
 					<tr class="cbi-section-table-titles">
 						<th class="cbi-section-table-cell"></th>
 						<th class="cbi-section-table-cell">区域</th>
-						<th class="cbi-section-table-cell">节点</th>
-						<th class="cbi-section-table-cell">地址</th>
 					</tr>
 				</thead>
 				<tbody id="nsc-tbody"></tbody>
@@ -81,10 +79,10 @@
 
 <script type="text/javascript">//<![CDATA[
 (function() {
-	var U_STATUS = '<%=luci.dispatcher.build_url("admin", "network", "nsclient", "status")%>';
-	var U_LOGIN = '<%=luci.dispatcher.build_url("admin", "network", "nsclient", "login")%>';
-	var U_CONNECT = '<%=luci.dispatcher.build_url("admin", "network", "nsclient", "connect")%>';
-	var U_DISCONNECT = '<%=luci.dispatcher.build_url("admin", "network", "nsclient", "disconnect")%>';
+	var U_STATUS = '<%=luci.dispatcher.build_url("admin", "vpn", "status")%>';
+	var U_LOGIN = '<%=luci.dispatcher.build_url("admin", "vpn", "login")%>';
+	var U_CONNECT = '<%=luci.dispatcher.build_url("admin", "vpn", "connect")%>';
+	var U_DISCONNECT = '<%=luci.dispatcher.build_url("admin", "vpn", "disconnect")%>';
 	var TOKEN = '<%=token%>';
 
 	var REGIONS = {
@@ -100,7 +98,13 @@
 
 	function regionLabel(code) {
 		if (!code) return '-';
-		return (REGIONS[code] || code.toUpperCase()) + ' (' + code + ')';
+		return REGIONS[code] || String(code).toUpperCase();
+	}
+
+	function displayAccount(s) {
+		s = String(s || '');
+		var i = s.indexOf('/');
+		return i >= 0 ? s.substring(0, i) : s;
 	}
 
 	function bytes(n) {
@@ -145,13 +149,10 @@
 			var n = nodes[i];
 			var tr = document.createElement('tr');
 			tr.className = 'cbi-section-table-row';
-			var ep = (n.server_ip || '') + (n.server_port ? (':' + n.server_port) : '');
 			tr.innerHTML =
 				'<td><input type="radio" name="nsc-region" value="' + (n.region || '') + '"' +
 				((n.region === region) ? ' checked="checked"' : '') + ' /></td>' +
-				'<td>' + regionLabel(n.region) + '</td>' +
-				'<td>' + (n.peer_name || '-') + '</td>' +
-				'<td>' + (n.private_ip || '-') + (ep ? (' → ' + ep) : '') + '</td>';
+				'<td>' + regionLabel(n.region) + '</td>';
 			tbody.appendChild(tr);
 		}
 	}
@@ -171,18 +172,15 @@
 			cls = 'nsc-off';
 		}
 		var parts = [state];
-		if (st.region) parts.push('出口 ' + regionLabel(st.region));
-		if (st.private_ip) parts.push('本机 ' + st.private_ip);
-		if (st.endpoint && st.endpoint !== '(none)') parts.push('对端 ' + st.endpoint);
-		if (st.handshake) parts.push('握手 ' + (st.handshake_age || 0) + 's 前');
-		if (st.connected) parts.push('↓ ' + bytes(st.rx) + '  ↑ ' + bytes(st.tx));
+		if (st.region) parts.push(regionLabel(st.region));
 		if (st.expired_text) parts.push('到期 ' + st.expired_text);
-		if (st.login_account) parts.push(st.login_account);
+		var shown = displayAccount(st.account || '');
+		if (shown) parts.push(shown);
 		box.className = 'nsc-status ' + cls;
 		box.textContent = parts.join(' · ');
 
 		if ($('nsc-account') && !$('nsc-account').value && st.account)
-			$('nsc-account').value = st.account;
+			$('nsc-account').value = displayAccount(st.account);
 		$('nsc-enable').checked = !!st.enable;
 		renderNodes(st.nodes, st.region || selectedRegion());
 	}

@@ -1,6 +1,6 @@
 {
 	"luci-app-nsclient": {
-		"description": "Grant access to NS Client",
+		"description": "Grant access to VPN",
 		"read": {
 			"uci": [ "nsclient" ]
 		},

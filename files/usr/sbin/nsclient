@@ -282,7 +282,7 @@ login() {
 	printf '%s' "$resp" > "$LOGIN_JSON"
 	chmod 600 "$LOGIN_JSON"
 	log "login ok account=$(printf '%s' "$resp" | jq -r '.data.account // empty')"
-	json_out "$(printf '%s' "$resp" | jq -c '{ok:true,code:.code,msg:.msg,account:.data.account,groupname:.data.groupname,expired_time:.data.expired_time,nodes:[.data.wg_tunnels[]? | {region,peer_name,private_ip,server_ip,server_port}]}')"
+	json_out "$(printf '%s' "$resp" | jq -c '{ok:true,code:.code,msg:.msg,account:(.data.account|tostring|split("/")[0]),expired_time:.data.expired_time,nodes:[.data.wg_tunnels[]? | {region}]}')"
 }
 
 need_login() {
@@ -605,9 +605,9 @@ status_json() {
 	groupname=""
 	login_status=""
 	if [ -s "$LOGIN_JSON" ]; then
-		nodes=$(jq -c '[.data.wg_tunnels[]? | {region,peer_name,private_ip,server_ip,server_port}]' "$LOGIN_JSON")
+		nodes=$(jq -c '[.data.wg_tunnels[]? | {region}]' "$LOGIN_JSON")
 		expired=$(jq -r '.data.expired_time // 0' "$LOGIN_JSON")
-		login_account=$(jq -r '.data.account // empty' "$LOGIN_JSON")
+		login_account=$(jq -r '.data.account // empty | split("/")[0]' "$LOGIN_JSON")
 		groupname=$(jq -r '.data.groupname // empty' "$LOGIN_JSON")
 		login_status=$(jq -r '.data.login_status // empty' "$LOGIN_JSON")
 		expired_text=$(fmt_expired "$expired")
