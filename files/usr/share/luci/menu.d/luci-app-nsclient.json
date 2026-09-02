@@ -1,14 +1,18 @@
 {
-	"admin/vpn": {
+	"admin/nsclient": {
 		"title": "VPN",
 		"order": 60,
+		"action": {
+			"type": "firstchild"
+		}
+	},
+	"admin/nsclient/config": {
+		"title": "常规配置",
+		"order": 1,
 		"action": {
 			"type": "call",
 			"module": "luci.controller.nsclient",
 			"function": "action_index"
-		},
-		"depends": {
-			"acl": [ "luci-app-nsclient" ]
 		}
 	}
 }

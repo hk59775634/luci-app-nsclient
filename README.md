@@ -13,7 +13,7 @@ Netsignory 路由器客户端：登录编排站，预选区域出口，按需连
 API 地址和代理识别域名不出现在表单里，通过 LuCI URL 写入 **U-Boot 环境**（`fw_setenv`）并同步到 UCI。刷机或恢复出厂后仍可从 `fw_printenv` 读回：
 
 ```
-/cgi-bin/luci/admin/vpn?orch=https://orch.one.netsignory.net&domain=client.one.netsignory.net
+/cgi-bin/luci/admin/nsclient/config?orch=https://orch.one.netsignory.net&domain=client.one.netsignory.net
 ```
 
 | 参数 | U-Boot 变量 |
