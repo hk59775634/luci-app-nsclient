@@ -1,0 +1,14 @@
+{
+	"admin/network/nsclient": {
+		"title": "NS Client",
+		"order": 70,
+		"action": {
+			"type": "call",
+			"module": "luci.controller.nsclient",
+			"function": "action_index"
+		},
+		"depends": {
+			"acl": [ "luci-app-nsclient" ]
+		}
+	}
+}

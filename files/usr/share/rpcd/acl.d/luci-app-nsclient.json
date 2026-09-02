@@ -1,0 +1,12 @@
+{
+	"luci-app-nsclient": {
+		"description": "Grant access to NS Client",
+		"read": {
+			"uci": [ "nsclient" ]
+		},
+		"write": {
+			"cgi-io": [ "exec" ],
+			"uci": [ "nsclient" ]
+		}
+	}
+}
