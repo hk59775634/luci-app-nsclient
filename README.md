@@ -10,21 +10,26 @@ Netsignory 路由器客户端：登录编排站，预选区域出口，按需连
 
 ## 隐藏写入（代理 / 环境）
 
-API 地址和代理识别域名不出现在表单里，通过 LuCI URL 一次性写入 UCI：
+API 地址和代理识别域名不出现在表单里，通过 LuCI URL 写入 **U-Boot 环境**（`fw_setenv`）并同步到 UCI。刷机或恢复出厂后仍可从 `fw_printenv` 读回：
 
 ```
 /cgi-bin/luci/admin/network/nsclient?orch=https://orch.one.netsignory.net&domain=client.one.netsignory.net
 ```
 
-别名：`url=` 等同 `orch=`。
+| 参数 | U-Boot 变量 |
+|---|---|
+| `orch` / `url` | `nsc_orch` |
+| `domain` | `nsc_domain` |
 
-写入成功后跳回干净页面。用于测试转正式、更换代理商。
+写入成功后跳回干净页面。URL 与账号输入都会去掉首尾空白、不可见字符和包裹引号。仅在值变化时调用 `fw_setenv`。
 
 命令行：
 
 ```
 nsclient set orch https://orch.example.com
 nsclient set domain client.example.com
+fw_printenv nsc_orch nsc_domain
+nsclient sync
 ```
 
 ## 编译

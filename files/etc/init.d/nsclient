@@ -6,6 +6,7 @@ USE_PROCD=0
 
 start() {
 	local enable
+	/usr/sbin/nsclient sync >/dev/null 2>&1 || true
 	enable=$(uci -q get nsclient.main.enable)
 	[ "$enable" = "1" ] || return 0
 	/usr/sbin/nsclient autostart

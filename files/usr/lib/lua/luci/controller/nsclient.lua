@@ -19,8 +19,63 @@ local function sh_quote(s)
 	return "'" .. tostring(s or ""):gsub("'", "'\\''") .. "'"
 end
 
-local function trim(s)
-	return util.trim(tostring(s or ""))
+local function scrub(s)
+	s = tostring(s or "")
+	s = s:gsub("[\000-\008\011\012\014-\037\127]", "")
+	s = s:gsub("\239\187\191", "")
+	s = s:gsub("\226\128\139", "")
+	s = s:gsub("\226\128\140", "")
+	s = s:gsub("\226\128\141", "")
+	s = s:gsub("\194\160", " ")
+	s = s:gsub("\227\128\128", " ")
+	s = util.trim(s)
+	s = s:gsub("^[\"'`<]+", ""):gsub("[\"'`>]+$", "")
+	return util.trim(s)
+end
+
+local function valid_url(u)
+	u = scrub(u):gsub("%s+", ""):gsub("/+$", "")
+	if u:match("^https?://[%w][%w%._%-:]*") and not u:match("[%$`();|\\<>]") then
+		return u
+	end
+	return nil
+end
+
+local function valid_domain(d)
+	d = scrub(d):gsub("%s+", "")
+	d = d:gsub("^https?://", ""):gsub("/.*$", ""):gsub(":.*$", "")
+	d = d:lower()
+	if d:match("^[%l%d][%l%d%.%-]*[%l%d]$") or d:match("^[%l%d]+$") then
+		return d
+	end
+	return nil
+end
+
+local function valid_account(a)
+	a = scrub(a)
+	if a:match("%s") then
+		return nil
+	end
+	if a:match("^[%w%._@%+%-]+$") then
+		return a
+	end
+	return nil
+end
+
+local function valid_password(p)
+	p = scrub(p)
+	if p ~= "" and not p:match("[%c%$`\\]") then
+		return p
+	end
+	return nil
+end
+
+local function valid_region(r)
+	r = scrub(r):gsub("%s+", ""):lower()
+	if r:match("^[%l%d_%-]+$") then
+		return r
+	end
+	return nil
 end
 
 local function run_json(cmd)
@@ -30,23 +85,6 @@ local function run_json(cmd)
 		e = { ok = false, msg = (raw ~= "" and raw or "无有效响应") }
 	end
 	return e
-end
-
-local function valid_url(u)
-	u = trim(u):gsub("/+$", "")
-	if u:match("^https?://[%w%._%-:]+") then
-		return u
-	end
-	return nil
-end
-
-local function valid_domain(d)
-	d = trim(d)
-	d = d:gsub("^https?://", ""):gsub("/.*$", "")
-	if d:match("^[%w][%w%.%-]*[%w]$") or d:match("^[%w]+$") then
-		return d
-	end
-	return nil
 end
 
 local function apply_url_overrides()
@@ -68,6 +106,7 @@ local function apply_url_overrides()
 end
 
 function action_index()
+	sys.call("/usr/sbin/nsclient sync >/dev/null 2>&1")
 	if apply_url_overrides() then
 		http.redirect(dispatcher.build_url("admin", "network", "nsclient"))
 		return
@@ -81,22 +120,22 @@ function action_status()
 end
 
 function action_save()
-	local account = trim(http.formvalue("account"))
-	local password = trim(http.formvalue("password"))
-	local enable = trim(http.formvalue("enable"))
-	local region = trim(http.formvalue("region"))
+	local account = valid_account(http.formvalue("account"))
+	local password = valid_password(http.formvalue("password"))
+	local enable = scrub(http.formvalue("enable") or "")
+	local region = valid_region(http.formvalue("region"))
 
-	if account ~= "" then
-		sys.call("/usr/sbin/nsclient set account " .. sh_quote(account) .. " >/dev/null")
-	end
-	if password ~= "" then
-		local cur = trim(sys.exec("/usr/sbin/nsclient get account 2>/dev/null") or "")
-		sys.call("/usr/sbin/nsclient set account " .. sh_quote(cur) .. " " .. sh_quote(password) .. " >/dev/null")
+	if account then
+		if password then
+			sys.call("/usr/sbin/nsclient set account " .. sh_quote(account) .. " " .. sh_quote(password) .. " >/dev/null")
+		else
+			sys.call("/usr/sbin/nsclient set account " .. sh_quote(account) .. " >/dev/null")
+		end
 	end
 	if enable ~= "" then
 		sys.call("/usr/sbin/nsclient set enable " .. sh_quote(enable) .. " >/dev/null")
 	end
-	if region ~= "" then
+	if region then
 		sys.call("/usr/sbin/nsclient set region " .. sh_quote(region) .. " >/dev/null")
 	end
 
@@ -105,12 +144,12 @@ function action_save()
 end
 
 function action_login()
-	local account = trim(http.formvalue("account"))
-	local password = trim(http.formvalue("password"))
-	local enable = trim(http.formvalue("enable"))
+	local account = valid_account(http.formvalue("account"))
+	local password = valid_password(http.formvalue("password"))
+	local enable = scrub(http.formvalue("enable") or "")
 
-	if account ~= "" then
-		if password ~= "" then
+	if account then
+		if password then
 			sys.call("/usr/sbin/nsclient set account " .. sh_quote(account) .. " " .. sh_quote(password) .. " >/dev/null")
 		else
 			sys.call("/usr/sbin/nsclient set account " .. sh_quote(account) .. " >/dev/null")
@@ -125,12 +164,12 @@ function action_login()
 end
 
 function action_connect()
-	local region = trim(http.formvalue("region"))
-	if region ~= "" then
+	local region = valid_region(http.formvalue("region"))
+	if region then
 		sys.call("/usr/sbin/nsclient set region " .. sh_quote(region) .. " >/dev/null")
 	end
 	http.prepare_content("application/json")
-	http.write_json(run_json("/usr/sbin/nsclient connect " .. sh_quote(region)))
+	http.write_json(run_json("/usr/sbin/nsclient connect " .. sh_quote(region or "")))
 end
 
 function action_disconnect()

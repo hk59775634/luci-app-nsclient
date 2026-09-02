@@ -187,6 +187,34 @@
 		renderNodes(st.nodes, st.region || selectedRegion());
 	}
 
+	function scrub(s) {
+		s = String(s == null ? '' : s);
+		s = s.replace(/[\u0000-\u001F\u007F\u200B-\u200F\uFEFF]/g, '');
+		s = s.replace(/[\u00A0\u3000]/g, ' ');
+		s = s.replace(/^[ \t]+|[ \t]+$/g, '');
+		s = s.replace(/^[\"'`<]+/, '').replace(/[\"'`>]+$/, '');
+		return s.replace(/^[ \t]+|[ \t]+$/g, '');
+	}
+
+	function scrubAccount(s) {
+		return scrub(s);
+	}
+
+	function scrubRegion(s) {
+		return scrub(s).replace(/\s+/g, '').toLowerCase();
+	}
+
+	function bindClean(id, kind) {
+		var el = $(id);
+		if (!el) return;
+		var clean = function() {
+			var v = kind === 'account' ? scrubAccount(el.value) : scrub(el.value);
+			if (el.value !== v) el.value = v;
+		};
+		el.addEventListener('blur', clean);
+		el.addEventListener('paste', function() { setTimeout(clean, 0); });
+	}
+
 	function post(url, fields, cb) {
 		var data = { token: TOKEN };
 		for (var k in fields) data[k] = fields[k];
@@ -197,12 +225,15 @@
 
 	function collect() {
 		return {
-			account: $('nsc-account').value,
-			password: $('nsc-password').value,
+			account: scrubAccount($('nsc-account').value),
+			password: scrub($('nsc-password').value),
 			enable: $('nsc-enable').checked ? '1' : '0',
-			region: selectedRegion()
+			region: scrubRegion(selectedRegion())
 		};
 	}
+
+	bindClean('nsc-account', 'account');
+	bindClean('nsc-password', 'password');
 
 	function withBusy(btn, work) {
 		if (busy) return;

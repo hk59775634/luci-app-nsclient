@@ -8,6 +8,9 @@ STATE_DIR=/var/run/nsclient
 LOGIN_JSON="$STATE_DIR/login.json"
 LOCK=/var/lock/nsclient.lock
 LOGIN_PATH=/api/router/login
+FW_ORCH=nsc_orch
+FW_DOMAIN=nsc_domain
+DEFAULT_ORCH=https://orch.one.netsignory.net
 
 . /lib/functions.sh 2>/dev/null || true
 
@@ -28,8 +31,23 @@ uci_set() {
 	uci -q set "${UCI_PKG}.${UCI_SEC}.$1=$2"
 }
 
+# 去掉复制带来的不可见字符、控制符、包裹引号/尖括号，并裁掉首尾空白
+scrub() {
+	local s bom zwsp nbsp idsp
+	s=$(printf '%s' "$1" | tr -d '\000-\010\013\014\016-\037\177')
+	bom=$(printf '\357\273\277')
+	zwsp=$(printf '\342\200\213')
+	nbsp=$(printf '\302\240')
+	idsp=$(printf '\343\200\200')
+	s=$(printf '%s' "$s" | sed -e "s/${bom}//g" -e "s/${zwsp}//g" -e "s/${nbsp}/ /g" -e "s/${idsp}/ /g")
+	s=$(printf '%s' "$s" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
+	s=$(printf '%s' "$s" | sed -e 's/^["'\''`<]*//' -e 's/["'\''`>]*$//')
+	s=$(printf '%s' "$s" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
+	printf '%s' "$s"
+}
+
 trim() {
-	printf '%s' "$1" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//'
+	scrub "$1"
 }
 
 ensure_uci() {
@@ -38,76 +56,167 @@ ensure_uci() {
 	uci -q commit "$UCI_PKG"
 }
 
+fw_get() {
+	local v
+	command -v fw_printenv >/dev/null 2>&1 || return 1
+	v=$(scrub "$(fw_printenv -n "$1" 2>/dev/null)")
+	[ -n "$v" ] && printf '%s' "$v"
+}
+
+fw_set_if_changed() {
+	local var="$1" new="$2" old
+	[ -n "$new" ] || return 0
+	command -v fw_setenv >/dev/null 2>&1 || return 0
+	old=$(fw_get "$var")
+	[ "$old" = "$new" ] && return 0
+	fw_setenv "$var" "$new" >/dev/null 2>&1 || {
+		log "fw_setenv $var failed"
+		return 1
+	}
+}
+
+uci_set_if_changed() {
+	local key="$1" new="$2" old
+	ensure_uci
+	old=$(scrub "$(uci_get "$key")")
+	[ "$old" = "$new" ] && return 0
+	uci_set "$key" "$new"
+	uci commit "$UCI_PKG"
+}
+
 normalize_url() {
 	local u
-	u=$(trim "$1")
+	u=$(scrub "$1")
+	u=$(printf '%s' "$u" | tr -d ' ')
 	u=$(printf '%s' "$u" | sed 's|/*$||')
 	case "$u" in
-		http://*|https://*)
-			printf '%s' "$u" | grep -qE '^https?://[A-Za-z0-9._:-]+(/.*)?$' || return 1
-			printf '%s' "$u"
-			return 0
+		[Hh][Tt][Tt][Pp]://*|[Hh][Tt][Tt][Pp][Ss]://*)
+			;;
+		*)
+			return 1
 			;;
 	esac
-	return 1
+	printf '%s' "$u" | grep -qE '^https?://[A-Za-z0-9][A-Za-z0-9._:-]*(/[A-Za-z0-9._~/%+-]*)?$' || return 1
+	printf '%s' "$u" | grep -qE '[`$();|\\<>]' && return 1
+	printf '%s' "$u"
 }
 
 normalize_domain() {
 	local d
-	d=$(trim "$1")
-	d=$(printf '%s' "$d" | sed 's|^https\?://||;s|/.*$||')
-	printf '%s' "$d" | grep -qE '^[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?$' || return 1
+	d=$(scrub "$1")
+	d=$(printf '%s' "$d" | tr -d ' ')
+	d=$(printf '%s' "$d" | sed 's|^[Hh][Tt][Tt][Pp][Ss]\?://||;s|/.*$||;s|:.*$||')
+	d=$(printf '%s' "$d" | tr 'A-Z' 'a-z')
+	printf '%s' "$d" | grep -qE '^[a-z0-9]([a-z0-9.-]*[a-z0-9])?$' || return 1
 	printf '%s' "$d"
+}
+
+normalize_account() {
+	local a
+	a=$(scrub "$1")
+	printf '%s' "$a" | grep -q '[[:space:]]' && return 1
+	printf '%s' "$a" | grep -qE '^[A-Za-z0-9._@+-]+$' || return 1
+	printf '%s' "$a"
+}
+
+normalize_password() {
+	local p
+	p=$(scrub "$1")
+	[ -n "$p" ] || return 1
+	printf '%s' "$p" | grep -qE '[[:cntrl:]`$\\]' && return 1
+	printf '%s' "$p"
+}
+
+normalize_region() {
+	local r
+	r=$(scrub "$1" | tr 'A-Z' 'a-z' | tr -d ' ')
+	printf '%s' "$r" | grep -qE '^[a-z0-9_-]+$' || return 1
+	printf '%s' "$r"
 }
 
 orch_url() {
 	local v
-	v=$(normalize_url "$(uci_get orch_url)") || true
-	[ -n "$v" ] && printf '%s' "$v" && return 0
-	printf '%s' "https://orch.one.netsignory.net"
+	v=$(normalize_url "$(fw_get "$FW_ORCH")") && {
+		uci_set_if_changed orch_url "$v"
+		printf '%s' "$v"
+		return 0
+	}
+	v=$(normalize_url "$(uci_get orch_url)") && {
+		printf '%s' "$v"
+		return 0
+	}
+	printf '%s' "$DEFAULT_ORCH"
 }
 
 agent_domain() {
 	local v
-	v=$(normalize_domain "$(uci_get domain)") || true
-	[ -n "$v" ] && printf '%s' "$v" && return 0
+	v=$(normalize_domain "$(fw_get "$FW_DOMAIN")") && {
+		uci_set_if_changed domain "$v"
+		printf '%s' "$v"
+		return 0
+	}
+	v=$(normalize_domain "$(uci_get domain)") && {
+		printf '%s' "$v"
+		return 0
+	}
 	return 1
+}
+
+sync_from_env() {
+	local v
+	v=$(normalize_url "$(fw_get "$FW_ORCH")") && uci_set_if_changed orch_url "$v"
+	v=$(normalize_domain "$(fw_get "$FW_DOMAIN")") && uci_set_if_changed domain "$v"
+	return 0
 }
 
 set_orch() {
 	local u
 	u=$(normalize_url "$1") || {
-		echo "invalid orch url: $1" >&2
+		echo "invalid orch url" >&2
 		return 1
 	}
-	ensure_uci
-	uci_set orch_url "$u"
-	uci commit "$UCI_PKG"
+	fw_set_if_changed "$FW_ORCH" "$u"
+	uci_set_if_changed orch_url "$u"
 	printf '%s\n' "$u"
 }
 
 set_domain() {
 	local d
 	d=$(normalize_domain "$1") || {
-		echo "invalid domain: $1" >&2
+		echo "invalid domain" >&2
 		return 1
 	}
-	ensure_uci
-	uci_set domain "$d"
-	uci commit "$UCI_PKG"
+	fw_set_if_changed "$FW_DOMAIN" "$d"
+	uci_set_if_changed domain "$d"
 	printf '%s\n' "$d"
 }
 
 set_account() {
+	local a p
+	a=$(normalize_account "$1") || {
+		echo "invalid account" >&2
+		return 1
+	}
 	ensure_uci
-	uci_set account "$(trim "$1")"
-	[ -n "${2+x}" ] && [ -n "$2" ] && uci_set password "$2"
+	uci_set account "$a"
+	if [ -n "${2+x}" ] && [ -n "$2" ]; then
+		p=$(normalize_password "$2") || {
+			echo "invalid password" >&2
+			return 1
+		}
+		uci_set password "$p"
+	fi
 	uci commit "$UCI_PKG"
 }
 
 set_region() {
+	local r
+	r=$(normalize_region "$1") || {
+		echo "invalid region" >&2
+		return 1
+	}
 	ensure_uci
-	uci_set region "$(trim "$1")"
+	uci_set region "$r"
 	uci commit "$UCI_PKG"
 }
 
@@ -132,8 +241,8 @@ login() {
 		json_out '{"ok":false,"code":0,"msg":"未配置代理识别域名"}'
 		return 1
 	}
-	account=$(trim "${1:-$(uci_get account)}")
-	password=$(trim "${2:-$(uci_get password)}")
+	account=$(normalize_account "${1:-$(uci_get account)}") || account=""
+	password=$(normalize_password "${2:-$(uci_get password)}") || password=""
 	if [ -z "$account" ] || [ -z "$password" ]; then
 		json_out '{"ok":false,"code":0,"msg":"请先填写账号和密码"}'
 		return 1
@@ -361,7 +470,7 @@ handshake_age() {
 
 connect() {
 	local region tun priv addr sip sport spub dns peer_name gw
-	region=$(trim "${1:-$(uci_get region)}")
+	region=$(normalize_region "${1:-$(uci_get region)}") || region=""
 
 	if need_login; then
 		login >/dev/null || {
@@ -445,7 +554,7 @@ disconnect() {
 
 autostart() {
 	local region
-	region=$(trim "$(uci_get region)")
+	region=$(normalize_region "$(uci_get region)") || region=""
 	login >/dev/null || return 1
 	connect "$region"
 }
@@ -463,7 +572,7 @@ status_json() {
 	local nodes endpoint private_ip peer_name
 
 	orch=$(orch_url)
-	domain=$(uci_get domain)
+	domain=$(agent_domain) || domain=""
 	account=$(uci_get account)
 	region=$(uci_get region)
 	enable=$(uci_get enable)
@@ -559,6 +668,7 @@ Usage: nsclient <command> [args]
   disconnect
   status
   autostart
+  sync
   get orch|domain|account|region|enable
   set orch <url>
   set domain <host>
@@ -577,10 +687,11 @@ case "$cmd" in
 	disconnect) disconnect ;;
 	status) status_json ;;
 	autostart) autostart ;;
+	sync) sync_from_env ;;
 	get)
 		case "$1" in
 			orch) orch_url; echo ;;
-			domain) uci_get domain; echo ;;
+			domain) agent_domain; echo ;;
 			account) uci_get account; echo ;;
 			region) uci_get region; echo ;;
 			enable) uci_get enable; echo ;;
