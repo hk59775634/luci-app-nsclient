@@ -1,0 +1,273 @@
+<%#
+	luci-app-nsclient — account/password + regional WireGuard exit
+-%>
+<%+header%>
+
+<style type="text/css">
+	#nsclient-app .nsc-status { margin: 0 0 1em 0; padding: .6em .8em; border-left: 4px solid #bbb; background: #f6f6f6; }
+	#nsclient-app .nsc-ok { border-left-color: #46a546; }
+	#nsclient-app .nsc-wait { border-left-color: #f89406; }
+	#nsclient-app .nsc-off { border-left-color: #999; }
+	#nsclient-app .nsc-err { border-left-color: #c00; }
+	#nsclient-app .nsc-msg { margin: .4em 0 1em; min-height: 1.2em; }
+	#nsclient-app table.nsc-nodes { width: 100%; }
+	#nsclient-app table.nsc-nodes td, #nsclient-app table.nsc-nodes th { padding: .35em .5em; }
+	#nsclient-app .nsc-actions { margin-top: .8em; }
+	#nsclient-app .nsc-actions input { margin-right: .4em; }
+	#nsclient-app .nsc-meta { color: #666; font-size: 90%; }
+	#nsclient-app input[type=text], #nsclient-app input[type=password] { width: 18em; }
+</style>
+
+<div class="cbi-map" id="nsclient-app">
+	<h2 name="content">NS Client</h2>
+	<div class="cbi-map-descr">登录后预选出口节点，再点击连接。按需切换不同区域。</div>
+
+	<div id="nsc-status" class="nsc-status nsc-off">正在读取状态…</div>
+	<div id="nsc-msg" class="nsc-msg"></div>
+
+	<fieldset class="cbi-section">
+		<legend>账号</legend>
+		<div class="cbi-section-node">
+			<div class="cbi-value">
+				<label class="cbi-value-title">账号</label>
+				<div class="cbi-value-field">
+					<input type="text" id="nsc-account" autocomplete="username" />
+				</div>
+			</div>
+			<div class="cbi-value">
+				<label class="cbi-value-title">密码</label>
+				<div class="cbi-value-field">
+					<input type="password" id="nsc-password" autocomplete="current-password" placeholder="已保存则可不改" />
+				</div>
+			</div>
+			<div class="cbi-value">
+				<label class="cbi-value-title">开机连接</label>
+				<div class="cbi-value-field">
+					<input type="checkbox" id="nsc-enable" />
+					使用上次选择的出口，开机后自动连接
+				</div>
+			</div>
+			<div class="cbi-value">
+				<label class="cbi-value-title"></label>
+				<div class="cbi-value-field nsc-actions">
+					<input type="button" class="cbi-button cbi-button-apply" id="nsc-login" value="登录并拉取节点" />
+				</div>
+			</div>
+		</div>
+	</fieldset>
+
+	<fieldset class="cbi-section">
+		<legend>出口节点</legend>
+		<div class="cbi-section-node">
+			<div id="nsc-empty" class="nsc-meta">请先登录以获取可用出口。</div>
+			<table class="table cbi-section-table nsc-nodes" id="nsc-table" style="display:none">
+				<thead>
+					<tr class="cbi-section-table-titles">
+						<th class="cbi-section-table-cell"></th>
+						<th class="cbi-section-table-cell">区域</th>
+						<th class="cbi-section-table-cell">节点</th>
+						<th class="cbi-section-table-cell">地址</th>
+					</tr>
+				</thead>
+				<tbody id="nsc-tbody"></tbody>
+			</table>
+			<div class="nsc-actions">
+				<input type="button" class="cbi-button cbi-button-save" id="nsc-connect" value="连接所选节点" />
+				<input type="button" class="cbi-button cbi-button-reset" id="nsc-disconnect" value="断开" />
+			</div>
+		</div>
+	</fieldset>
+</div>
+
+<script type="text/javascript">//<![CDATA[
+(function() {
+	var U_STATUS = '<%=luci.dispatcher.build_url("admin", "network", "nsclient", "status")%>';
+	var U_LOGIN = '<%=luci.dispatcher.build_url("admin", "network", "nsclient", "login")%>';
+	var U_CONNECT = '<%=luci.dispatcher.build_url("admin", "network", "nsclient", "connect")%>';
+	var U_DISCONNECT = '<%=luci.dispatcher.build_url("admin", "network", "nsclient", "disconnect")%>';
+	var TOKEN = '<%=token%>';
+
+	var REGIONS = {
+		hk: '香港', us: '美国', sg: '新加坡', jp: '日本',
+		tw: '台湾', uk: '英国', de: '德国', kr: '韩国',
+		au: '澳洲', in: '印度'
+	};
+
+	var lastNodes = [];
+	var busy = false;
+
+	function $(id) { return document.getElementById(id); }
+
+	function regionLabel(code) {
+		if (!code) return '-';
+		return (REGIONS[code] || code.toUpperCase()) + ' (' + code + ')';
+	}
+
+	function bytes(n) {
+		n = parseFloat(n) || 0;
+		if (n < 1024) return n + ' B';
+		var u = ['KiB', 'MiB', 'GiB', 'TiB'], i = 0;
+		n /= 1024;
+		while (n >= 1024 && i < u.length - 1) { n /= 1024; i++; }
+		return n.toFixed(1) + ' ' + u[i];
+	}
+
+	function setMsg(text, isErr) {
+		var el = $('nsc-msg');
+		el.textContent = text || '';
+		el.style.color = isErr ? '#c00' : '#2a2';
+	}
+
+	function selectedRegion() {
+		var radios = document.getElementsByName('nsc-region');
+		for (var i = 0; i < radios.length; i++) {
+			if (radios[i].checked) return radios[i].value;
+		}
+		return '';
+	}
+
+	function renderNodes(nodes, region) {
+		nodes = nodes || [];
+		lastNodes = nodes;
+		var table = $('nsc-table');
+		var tbody = $('nsc-tbody');
+		var empty = $('nsc-empty');
+		tbody.innerHTML = '';
+		if (!nodes.length) {
+			table.style.display = 'none';
+			empty.style.display = '';
+			return;
+		}
+		empty.style.display = 'none';
+		table.style.display = '';
+		if (!region) region = nodes[0].region;
+		for (var i = 0; i < nodes.length; i++) {
+			var n = nodes[i];
+			var tr = document.createElement('tr');
+			tr.className = 'cbi-section-table-row';
+			var ep = (n.server_ip || '') + (n.server_port ? (':' + n.server_port) : '');
+			tr.innerHTML =
+				'<td><input type="radio" name="nsc-region" value="' + (n.region || '') + '"' +
+				((n.region === region) ? ' checked="checked"' : '') + ' /></td>' +
+				'<td>' + regionLabel(n.region) + '</td>' +
+				'<td>' + (n.peer_name || '-') + '</td>' +
+				'<td>' + (n.private_ip || '-') + (ep ? (' → ' + ep) : '') + '</td>';
+			tbody.appendChild(tr);
+		}
+	}
+
+	function renderStatus(st) {
+		if (!st) return;
+		var box = $('nsc-status');
+		var state, cls;
+		if (st.connected && st.handshake) {
+			state = '已连接';
+			cls = 'nsc-ok';
+		} else if (st.connected) {
+			state = '连接中（等待握手）';
+			cls = 'nsc-wait';
+		} else {
+			state = '未连接';
+			cls = 'nsc-off';
+		}
+		var parts = [state];
+		if (st.region) parts.push('出口 ' + regionLabel(st.region));
+		if (st.private_ip) parts.push('本机 ' + st.private_ip);
+		if (st.endpoint && st.endpoint !== '(none)') parts.push('对端 ' + st.endpoint);
+		if (st.handshake) parts.push('握手 ' + (st.handshake_age || 0) + 's 前');
+		if (st.connected) parts.push('↓ ' + bytes(st.rx) + '  ↑ ' + bytes(st.tx));
+		if (st.expired_text) parts.push('到期 ' + st.expired_text);
+		if (st.login_account) parts.push(st.login_account);
+		box.className = 'nsc-status ' + cls;
+		box.textContent = parts.join(' · ');
+
+		if ($('nsc-account') && !$('nsc-account').value && st.account)
+			$('nsc-account').value = st.account;
+		$('nsc-enable').checked = !!st.enable;
+		renderNodes(st.nodes, st.region || selectedRegion());
+	}
+
+	function post(url, fields, cb) {
+		var data = { token: TOKEN };
+		for (var k in fields) data[k] = fields[k];
+		new XHR().post(url, data, function(x, json) {
+			cb(json || {}, x);
+		});
+	}
+
+	function collect() {
+		return {
+			account: $('nsc-account').value,
+			password: $('nsc-password').value,
+			enable: $('nsc-enable').checked ? '1' : '0',
+			region: selectedRegion()
+		};
+	}
+
+	function withBusy(btn, work) {
+		if (busy) return;
+		busy = true;
+		var old = btn && btn.value;
+		if (btn) { btn.disabled = true; btn.value = '处理中…'; }
+		work(function() {
+			busy = false;
+			if (btn) { btn.disabled = false; btn.value = old; }
+		});
+	}
+
+	$('nsc-login').onclick = function() {
+		var btn = this;
+		withBusy(btn, function(done) {
+			setMsg('正在登录…');
+			post(U_LOGIN, collect(), function(j) {
+				if (j && j.ok) {
+					setMsg(j.msg || '登录成功');
+					if (j.nodes && j.nodes.length)
+						renderNodes(j.nodes, selectedRegion() || j.nodes[0].region);
+					new XHR().get(U_STATUS, null, function(x, st) { renderStatus(st); });
+				} else {
+					setMsg((j && j.msg) || '登录失败', true);
+				}
+				done();
+			});
+		});
+	};
+
+	$('nsc-connect').onclick = function() {
+		var btn = this;
+		var region = selectedRegion();
+		if (!region) { setMsg('请先选择一个出口节点', true); return; }
+		withBusy(btn, function(done) {
+			setMsg('正在连接 ' + regionLabel(region) + ' …');
+			var f = collect();
+			f.region = region;
+			post(U_CONNECT, f, function(j) {
+				if (j && j.ok) setMsg(j.msg || '已连接');
+				else setMsg((j && j.msg) || '连接失败', true);
+				new XHR().get(U_STATUS, null, function(x, st) { renderStatus(st); });
+				done();
+			});
+		});
+	};
+
+	$('nsc-disconnect').onclick = function() {
+		var btn = this;
+		withBusy(btn, function(done) {
+			setMsg('正在断开…');
+			post(U_DISCONNECT, { token: TOKEN }, function(j) {
+				if (j && j.ok) setMsg(j.msg || '已断开');
+				else setMsg((j && j.msg) || '断开失败', true);
+				new XHR().get(U_STATUS, null, function(x, st) { renderStatus(st); });
+				done();
+			});
+		});
+	};
+
+	XHR.poll(3, U_STATUS, null, function(x, st) {
+		if (!busy) renderStatus(st);
+	});
+	new XHR().get(U_STATUS, null, function(x, st) { renderStatus(st); });
+})();
+//]]></script>
+
+<%+footer%>

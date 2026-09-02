@@ -1,0 +1,602 @@
+#!/bin/sh
+# nsclient — Netsignory orchestrator login + on-demand WireGuard exit
+
+UCI_PKG=nsclient
+UCI_SEC=main
+IFNAME=nsclient
+STATE_DIR=/var/run/nsclient
+LOGIN_JSON="$STATE_DIR/login.json"
+LOCK=/var/lock/nsclient.lock
+LOGIN_PATH=/api/router/login
+
+. /lib/functions.sh 2>/dev/null || true
+
+log() {
+	logger -t nsclient "$*"
+	echo "$*" >&2
+}
+
+json_out() {
+	printf '%s\n' "$1"
+}
+
+uci_get() {
+	uci -q get "${UCI_PKG}.${UCI_SEC}.$1"
+}
+
+uci_set() {
+	uci -q set "${UCI_PKG}.${UCI_SEC}.$1=$2"
+}
+
+trim() {
+	printf '%s' "$1" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//'
+}
+
+ensure_uci() {
+	uci -q get "${UCI_PKG}.${UCI_SEC}" >/dev/null 2>&1 && return 0
+	uci -q set "${UCI_PKG}.${UCI_SEC}=nsclient"
+	uci -q commit "$UCI_PKG"
+}
+
+normalize_url() {
+	local u
+	u=$(trim "$1")
+	u=$(printf '%s' "$u" | sed 's|/*$||')
+	case "$u" in
+		http://*|https://*)
+			printf '%s' "$u" | grep -qE '^https?://[A-Za-z0-9._:-]+(/.*)?$' || return 1
+			printf '%s' "$u"
+			return 0
+			;;
+	esac
+	return 1
+}
+
+normalize_domain() {
+	local d
+	d=$(trim "$1")
+	d=$(printf '%s' "$d" | sed 's|^https\?://||;s|/.*$||')
+	printf '%s' "$d" | grep -qE '^[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?$' || return 1
+	printf '%s' "$d"
+}
+
+orch_url() {
+	local v
+	v=$(normalize_url "$(uci_get orch_url)") || true
+	[ -n "$v" ] && printf '%s' "$v" && return 0
+	printf '%s' "https://orch.one.netsignory.net"
+}
+
+agent_domain() {
+	local v
+	v=$(normalize_domain "$(uci_get domain)") || true
+	[ -n "$v" ] && printf '%s' "$v" && return 0
+	return 1
+}
+
+set_orch() {
+	local u
+	u=$(normalize_url "$1") || {
+		echo "invalid orch url: $1" >&2
+		return 1
+	}
+	ensure_uci
+	uci_set orch_url "$u"
+	uci commit "$UCI_PKG"
+	printf '%s\n' "$u"
+}
+
+set_domain() {
+	local d
+	d=$(normalize_domain "$1") || {
+		echo "invalid domain: $1" >&2
+		return 1
+	}
+	ensure_uci
+	uci_set domain "$d"
+	uci commit "$UCI_PKG"
+	printf '%s\n' "$d"
+}
+
+set_account() {
+	ensure_uci
+	uci_set account "$(trim "$1")"
+	[ -n "${2+x}" ] && [ -n "$2" ] && uci_set password "$2"
+	uci commit "$UCI_PKG"
+}
+
+set_region() {
+	ensure_uci
+	uci_set region "$(trim "$1")"
+	uci commit "$UCI_PKG"
+}
+
+set_enable() {
+	ensure_uci
+	case "$1" in
+		1|on|true|yes) uci_set enable 1 ;;
+		*) uci_set enable 0 ;;
+	esac
+	uci commit "$UCI_PKG"
+}
+
+mkdir_state() {
+	mkdir -p "$STATE_DIR"
+	chmod 700 "$STATE_DIR"
+}
+
+login() {
+	local orch domain account password body resp code msg
+	orch=$(orch_url)
+	domain=$(agent_domain) || {
+		json_out '{"ok":false,"code":0,"msg":"未配置代理识别域名"}'
+		return 1
+	}
+	account=$(trim "${1:-$(uci_get account)}")
+	password=$(trim "${2:-$(uci_get password)}")
+	if [ -z "$account" ] || [ -z "$password" ]; then
+		json_out '{"ok":false,"code":0,"msg":"请先填写账号和密码"}'
+		return 1
+	fi
+
+	ensure_uci
+	uci_set account "$account"
+	uci_set password "$password"
+	uci commit "$UCI_PKG"
+
+	mkdir_state
+	body=$(jq -nc --arg d "$domain" --arg a "$account" --arg p "$password" \
+		'{domain:$d,account:$a,password:$p}') || {
+		json_out '{"ok":false,"code":0,"msg":"无法构造登录请求"}'
+		return 1
+	}
+
+	resp=$(curl_post_json "${orch}${LOGIN_PATH}" "$body" 2>"$STATE_DIR/curl.err") || {
+		msg=$(tr '\n' ' ' < "$STATE_DIR/curl.err" 2>/dev/null)
+		json_out "$(jq -nc --arg m "登录请求失败: ${msg:-network error}" '{ok:false,code:0,msg:$m}')"
+		return 1
+	}
+
+	printf '%s' "$resp" | jq -e . >/dev/null 2>&1 || {
+		json_out '{"ok":false,"code":0,"msg":"服务器返回了无法解析的数据"}'
+		return 1
+	}
+
+	code=$(printf '%s' "$resp" | jq -r '.code // 0')
+	msg=$(printf '%s' "$resp" | jq -r '.msg // empty')
+	if [ "$code" != "200" ]; then
+		[ -n "$msg" ] || msg="登录失败"
+		json_out "$(jq -nc --argjson c "$code" --arg m "$msg" '{ok:false,code:$c,msg:$m}')"
+		return 1
+	fi
+
+	printf '%s' "$resp" > "$LOGIN_JSON"
+	chmod 600 "$LOGIN_JSON"
+	log "login ok account=$(printf '%s' "$resp" | jq -r '.data.account // empty')"
+	json_out "$(printf '%s' "$resp" | jq -c '{ok:true,code:.code,msg:.msg,account:.data.account,groupname:.data.groupname,expired_time:.data.expired_time,nodes:[.data.wg_tunnels[]? | {region,peer_name,private_ip,server_ip,server_port}]}')"
+}
+
+need_login() {
+	[ -s "$LOGIN_JSON" ] || return 0
+	jq -e '.data.wg_tunnels | type=="array" and length>0' "$LOGIN_JSON" >/dev/null 2>&1 || return 0
+	return 1
+}
+
+tunnel_of() {
+	local region
+	region=$(trim "$1")
+	[ -s "$LOGIN_JSON" ] || return 1
+	if [ -n "$region" ]; then
+		jq -ce --arg r "$region" '.data.wg_tunnels[] | select(.region==$r)' "$LOGIN_JSON"
+	else
+		jq -ce '.data.wg_tunnels[0]' "$LOGIN_JSON"
+	fi
+}
+
+clean_wg_uci() {
+	uci -q delete network."$IFNAME"
+	uci -q delete network."${IFNAME}_peer"
+	while uci -q delete "network.@wireguard_${IFNAME}[0]" 2>/dev/null; do
+		:
+	done
+}
+
+ensure_wan_zone() {
+	local i name nets n found
+	i=0
+	while uci -q get "firewall.@zone[$i]" >/dev/null 2>&1; do
+		name=$(uci -q get "firewall.@zone[$i].name")
+		if [ "$name" = "wan" ]; then
+			found=0
+			nets=$(uci -q get "firewall.@zone[$i].network")
+			for n in $nets; do
+				[ "$n" = "$IFNAME" ] && found=1
+			done
+			if [ "$found" != "1" ]; then
+				uci -q add_list "firewall.@zone[$i].network=$IFNAME"
+				uci commit firewall
+				/etc/init.d/firewall reload >/dev/null 2>&1 || true
+			fi
+			return 0
+		fi
+		i=$((i + 1))
+	done
+	return 1
+}
+
+wan_dns_list() {
+	awk '/^nameserver[ \t]+[0-9]/{print $2}' \
+		/tmp/resolv.conf.d/resolv.conf.auto \
+		/tmp/resolv.conf.auto \
+		/etc/resolv.conf 2>/dev/null | grep -vE '^(127\.|0\.)' | awk '!a[$0]++'
+	echo 8.8.8.8
+	echo 1.1.1.1
+}
+
+# busybox nslookup: "Address 1: 1.2.3.4"
+resolve_ipv4() {
+	local host dns ip
+	host=$(trim "$1")
+	[ -n "$host" ] || return 1
+	case "$host" in
+		[0-9]*.[0-9]*.[0-9]*.[0-9]*) printf '%s' "$host"; return 0 ;;
+	esac
+	for dns in $(wan_dns_list); do
+		ip=$(nslookup "$host" "$dns" 2>/dev/null | awk '/^Address 1:/{print $3; exit}')
+		[ -n "$ip" ] || ip=$(nslookup "$host" "$dns" 2>/dev/null | awk '/^Address: / && $2 !~ /#/ {print $2; exit}')
+		case "$ip" in
+			[0-9]*.[0-9]*.[0-9]*.[0-9]*)
+				printf '%s' "$ip"
+				return 0
+				;;
+		esac
+	done
+	return 1
+}
+
+ensure_clock() {
+	local y
+	y=$(date +%Y 2>/dev/null)
+	[ -n "$y" ] && [ "$y" -ge 2025 ] 2>/dev/null && return 0
+	ntpd -n -q -p 203.107.6.88 -p 162.159.200.1 -p 8.8.8.8 >/dev/null 2>&1 || true
+}
+
+ensure_dns() {
+	[ -s /tmp/resolv.conf.auto ] && return 0
+	[ -s /tmp/resolv.conf.d/resolv.conf.auto ] || return 0
+	cp /tmp/resolv.conf.d/resolv.conf.auto /tmp/resolv.conf.auto 2>/dev/null || true
+}
+
+curl_one() {
+	local url body host port ip extra
+	url=$1
+	body=$2
+	host=$(printf '%s' "$url" | sed 's|^https\?://||;s|/.*||;s|:.*||')
+	case "$url" in
+		http://*) port=80 ;;
+		*) port=443 ;;
+	esac
+	printf '%s' "$url" | grep -qE ':[0-9]+(/|$)' && port=$(printf '%s' "$url" | sed -n 's|^https\?://[^/]*:\([0-9]*\).*|\1|p')
+	extra=""
+	ip=$(resolve_ipv4 "$host") || true
+	[ -n "$ip" ] && extra="--resolve ${host}:${port}:${ip}"
+	# shellcheck disable=SC2086
+	curl -sS --http1.1 -m "${3:-15}" -X POST $extra "$url" \
+		-H 'Content-Type: application/json' \
+		-H 'Accept: application/json' \
+		--data-binary "$body"
+}
+
+curl_post_json() {
+	local url body alt
+	url=$1
+	body=$2
+	ensure_clock
+	ensure_dns
+	case "$url" in
+		https://*)
+			if curl_one "$url" "$body" 6; then
+				return 0
+			fi
+			alt="http://${url#https://}"
+			log "https failed, retry $alt"
+			curl_one "$alt" "$body" 15
+			return $?
+			;;
+	esac
+	curl_one "$url" "$body" 15
+}
+
+wan_gw() {
+	ip -4 route show default 2>/dev/null | awk '/via/ && /eth1/ {print $3; exit}'
+}
+
+pin_host_via_wan() {
+	local host ip gw
+	host=$(trim "$1")
+	gw=$(trim "$2")
+	[ -n "$host" ] || return 0
+	[ -n "$gw" ] || gw=$(wan_gw)
+	[ -n "$gw" ] || return 0
+	ip=$(resolve_ipv4 "$host") || return 0
+	ip route replace "$ip/32" via "$gw" dev eth1 2>/dev/null || true
+}
+
+if_up() {
+	ip link show "$IFNAME" >/dev/null 2>&1
+}
+
+wait_if_up() {
+	local i=0
+	while [ "$i" -lt 12 ]; do
+		if_up && return 0
+		sleep 1
+		i=$((i + 1))
+	done
+	return 1
+}
+
+save_wan_default() {
+	local gw
+	mkdir_state
+	gw=$(wan_gw)
+	[ -n "$gw" ] && printf '%s' "$gw" > "$STATE_DIR/wan_gw"
+}
+
+restore_wan_default() {
+	local gw
+	gw=$(cat "$STATE_DIR/wan_gw" 2>/dev/null)
+	[ -n "$gw" ] || gw=$(wan_gw)
+	[ -n "$gw" ] || gw=10.254.0.1
+	ip -4 route replace default via "$gw" dev eth1 2>/dev/null || true
+}
+
+handshake_age() {
+	local ts now
+	ts=$(wg show "$IFNAME" latest-handshakes 2>/dev/null | awk 'NF>=2 && $2+0>0 {print $2; exit}')
+	[ -n "$ts" ] || { echo 0; return 1; }
+	now=$(date +%s)
+	echo $((now - ts))
+}
+
+connect() {
+	local region tun priv addr sip sport spub dns peer_name gw
+	region=$(trim "${1:-$(uci_get region)}")
+
+	if need_login; then
+		login >/dev/null || {
+			json_out '{"ok":false,"msg":"登录失败，无法连接"}'
+			return 1
+		}
+	fi
+
+	tun=$(tunnel_of "$region") || {
+		json_out "$(jq -nc --arg r "$region" '{ok:false,msg:("没有可用的出口节点" + ( $r|length>0 ? (": "+$r) : "" ))}')"
+		return 1
+	}
+
+	region=$(printf '%s' "$tun" | jq -r '.region // empty')
+	priv=$(printf '%s' "$tun" | jq -r '.private_key // empty')
+	addr=$(printf '%s' "$tun" | jq -r '.private_ip // empty')
+	sip=$(printf '%s' "$tun" | jq -r '.server_ip // empty')
+	sport=$(printf '%s' "$tun" | jq -r '.server_port // empty')
+	spub=$(printf '%s' "$tun" | jq -r '.server_public_key // empty')
+	dns=$(printf '%s' "$tun" | jq -r '.dns[0] // empty')
+	peer_name=$(printf '%s' "$tun" | jq -r '.peer_name // empty')
+
+	if [ -z "$priv" ] || [ -z "$addr" ] || [ -z "$sip" ] || [ -z "$spub" ]; then
+		json_out '{"ok":false,"msg":"节点连接信息不完整"}'
+		return 1
+	fi
+	[ -n "$sport" ] || sport=51820
+
+	set_region "$region"
+	save_wan_default
+	gw=$(cat "$STATE_DIR/wan_gw" 2>/dev/null)
+	[ -n "$gw" ] || gw=$(wan_gw)
+	pin_host_via_wan "$sip" "$gw"
+	pin_host_via_wan "$(orch_url | sed 's|^https\?://||;s|/.*||')" "$gw"
+
+	ifdown "$IFNAME" >/dev/null 2>&1 || true
+	clean_wg_uci
+
+	uci -q set "network.${IFNAME}=interface"
+	uci -q set "network.${IFNAME}.proto=wireguard"
+	uci -q set "network.${IFNAME}.private_key=$priv"
+	uci -q add_list "network.${IFNAME}.addresses=${addr}/32"
+	uci -q set "network.${IFNAME}.mtu=1420"
+	[ -n "$dns" ] && uci -q add_list "network.${IFNAME}.dns=$dns"
+
+	uci -q set "network.${IFNAME}_peer=wireguard_${IFNAME}"
+	uci -q set "network.${IFNAME}_peer.public_key=$spub"
+	uci -q set "network.${IFNAME}_peer.endpoint_host=$sip"
+	uci -q set "network.${IFNAME}_peer.endpoint_port=$sport"
+	uci -q add_list "network.${IFNAME}_peer.allowed_ips=0.0.0.0/0"
+	uci -q set "network.${IFNAME}_peer.route_allowed_ips=1"
+	uci -q set "network.${IFNAME}_peer.persistent_keepalive=25"
+	uci commit network
+
+	ensure_wan_zone
+	ifup "$IFNAME"
+	pin_host_via_wan "$sip" "$gw"
+	pin_host_via_wan "$(orch_url | sed 's|^https\?://||;s|/.*||')" "$gw"
+
+	if ! wait_if_up; then
+		restore_wan_default
+		json_out '{"ok":false,"msg":"WireGuard 接口启动失败"}'
+		return 1
+	fi
+
+	log "connected region=$region peer=$peer_name endpoint=${sip}:${sport}"
+	json_out "$(jq -nc --arg r "$region" --arg p "$peer_name" --arg ip "$addr" \
+		--arg ep "${sip}:${sport}" \
+		'{ok:true,msg:"已连接",region:$r,peer_name:$p,private_ip:$ip,endpoint:$ep}')"
+}
+
+disconnect() {
+	ifdown "$IFNAME" >/dev/null 2>&1 || true
+	ip link del dev "$IFNAME" >/dev/null 2>&1 || true
+	clean_wg_uci
+	uci commit network
+	restore_wan_default
+	log "disconnected"
+	json_out '{"ok":true,"msg":"已断开"}'
+}
+
+autostart() {
+	local region
+	region=$(trim "$(uci_get region)")
+	login >/dev/null || return 1
+	connect "$region"
+}
+
+fmt_expired() {
+	local ts
+	ts=$(trim "$1")
+	[ -n "$ts" ] && [ "$ts" != "null" ] && [ "$ts" -gt 0 ] 2>/dev/null || return 0
+	date -d "@$ts" '+%Y-%m-%d %H:%M:%S' 2>/dev/null || date -D '%s' -d "$ts" '+%Y-%m-%d %H:%M:%S' 2>/dev/null || echo "$ts"
+}
+
+status_json() {
+	local orch domain account region enable connected handshake age rx tx
+	local expired expired_text login_account groupname login_status
+	local nodes endpoint private_ip peer_name
+
+	orch=$(orch_url)
+	domain=$(uci_get domain)
+	account=$(uci_get account)
+	region=$(uci_get region)
+	enable=$(uci_get enable)
+	[ -n "$enable" ] || enable=0
+
+	connected=false
+	handshake=false
+	age=0
+	rx=0
+	tx=0
+	endpoint=""
+	private_ip=""
+	peer_name=""
+
+	if if_up; then
+		connected=true
+		age=$(handshake_age) && [ "$age" -ge 0 ] && [ "$age" -lt 180 ] && handshake=true
+		rx=$(wg show "$IFNAME" transfer 2>/dev/null | awk 'NF>=3 {print $2; exit}')
+		tx=$(wg show "$IFNAME" transfer 2>/dev/null | awk 'NF>=3 {print $3; exit}')
+		[ -n "$rx" ] || rx=0
+		[ -n "$tx" ] || tx=0
+		endpoint=$(wg show "$IFNAME" endpoints 2>/dev/null | awk 'NF>=2 {print $2; exit}')
+		private_ip=$(ip -4 -o addr show dev "$IFNAME" 2>/dev/null | awk '{print $4}' | head -n1 | cut -d/ -f1)
+	fi
+
+	nodes='[]'
+	expired=0
+	expired_text=""
+	login_account=""
+	groupname=""
+	login_status=""
+	if [ -s "$LOGIN_JSON" ]; then
+		nodes=$(jq -c '[.data.wg_tunnels[]? | {region,peer_name,private_ip,server_ip,server_port}]' "$LOGIN_JSON")
+		expired=$(jq -r '.data.expired_time // 0' "$LOGIN_JSON")
+		login_account=$(jq -r '.data.account // empty' "$LOGIN_JSON")
+		groupname=$(jq -r '.data.groupname // empty' "$LOGIN_JSON")
+		login_status=$(jq -r '.data.login_status // empty' "$LOGIN_JSON")
+		expired_text=$(fmt_expired "$expired")
+		if [ -n "$region" ]; then
+			peer_name=$(jq -r --arg r "$region" '.data.wg_tunnels[]? | select(.region==$r) | .peer_name // empty' "$LOGIN_JSON" | head -n1)
+		fi
+	fi
+
+	jq -nc \
+		--arg orch "$orch" \
+		--arg domain "$domain" \
+		--arg account "$account" \
+		--arg region "$region" \
+		--argjson enable "$enable" \
+		--argjson connected "$connected" \
+		--argjson handshake "$handshake" \
+		--argjson handshake_age "$age" \
+		--argjson rx "${rx:-0}" \
+		--argjson tx "${tx:-0}" \
+		--arg endpoint "${endpoint:-}" \
+		--arg private_ip "${private_ip:-}" \
+		--arg peer_name "${peer_name:-}" \
+		--argjson expired "${expired:-0}" \
+		--arg expired_text "${expired_text:-}" \
+		--arg login_account "$login_account" \
+		--arg groupname "$groupname" \
+		--arg login_status "$login_status" \
+		--argjson nodes "$nodes" \
+		'{
+			ok:true,
+			orch:$orch,
+			domain:$domain,
+			account:$account,
+			region:$region,
+			enable:$enable,
+			connected:$connected,
+			handshake:$handshake,
+			handshake_age:$handshake_age,
+			rx:$rx,
+			tx:$tx,
+			endpoint:$endpoint,
+			private_ip:$private_ip,
+			peer_name:$peer_name,
+			expired_time:$expired,
+			expired_text:$expired_text,
+			login_account:$login_account,
+			groupname:$groupname,
+			login_status:$login_status,
+			nodes:$nodes
+		}'
+}
+
+usage() {
+	cat <<EOF
+Usage: nsclient <command> [args]
+  login [account] [password]
+  connect [region]
+  disconnect
+  status
+  autostart
+  get orch|domain|account|region|enable
+  set orch <url>
+  set domain <host>
+  set account <user> [password]
+  set region <region>
+  set enable <0|1>
+EOF
+}
+
+cmd=$1
+shift 2>/dev/null || true
+
+case "$cmd" in
+	login) login "$@" ;;
+	connect) connect "$@" ;;
+	disconnect) disconnect ;;
+	status) status_json ;;
+	autostart) autostart ;;
+	get)
+		case "$1" in
+			orch) orch_url; echo ;;
+			domain) uci_get domain; echo ;;
+			account) uci_get account; echo ;;
+			region) uci_get region; echo ;;
+			enable) uci_get enable; echo ;;
+			*) usage; exit 1 ;;
+		esac
+		;;
+	set)
+		case "$1" in
+			orch) set_orch "$2" ;;
+			domain) set_domain "$2" ;;
+			account) set_account "$2" "$3" ;;
+			region) set_region "$2" ;;
+			enable) set_enable "$2" ;;
+			*) usage; exit 1 ;;
+		esac
+		;;
+	""|-h|--help) usage ;;
+	*) usage; exit 1 ;;
+esac
