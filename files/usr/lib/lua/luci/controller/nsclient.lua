@@ -8,7 +8,7 @@ local dispatcher = require "luci.dispatcher"
 
 function index()
 	entry({"admin", "nsclient"}, firstchild(), "VPN", 60).dependent = false
-	entry({"admin", "nsclient", "config"}, call("action_index"), "常规配置", 1)
+	entry({"admin", "nsclient", "config"}, call("action_index"), "连接", 1)
 	entry({"admin", "nsclient", "status"}, call("action_status")).leaf = true
 	entry({"admin", "nsclient", "login"}, call("action_login")).leaf = true
 	entry({"admin", "nsclient", "connect"}, call("action_connect")).leaf = true
@@ -79,9 +79,21 @@ local function valid_region(r)
 	return nil
 end
 
+local function valid_split(v)
+	v = scrub(v)
+	if v == "1" or v == "0" then
+		return v
+	end
+	return nil
+end
+
 local function run_json(cmd)
 	local raw = util.trim(sys.exec(cmd .. " 2>/dev/null") or "")
 	local e = jsonc.parse(raw)
+	if type(e) ~= "table" then
+		local blob = raw:match("(%{.*%})%s*$")
+		e = blob and jsonc.parse(blob)
+	end
 	if type(e) ~= "table" then
 		e = { ok = false, msg = (raw ~= "" and raw or "无有效响应") }
 	end
@@ -106,13 +118,27 @@ local function apply_url_overrides()
 	return changed
 end
 
+local function read_status_cache_json()
+	local f = io.open("/var/run/nsclient/status.json", "r")
+	if not f then
+		return "{}"
+	end
+	local raw = util.trim(f:read("*a") or "")
+	f:close()
+	if raw ~= "" and type(jsonc.parse(raw)) == "table" then
+		return raw
+	end
+	return "{}"
+end
+
 function action_index()
-	sys.call("/usr/sbin/nsclient sync >/dev/null 2>&1")
 	if apply_url_overrides() then
 		http.redirect(dispatcher.build_url("admin", "nsclient", "config"))
 		return
 	end
-	luci.template.render("nsclient/main")
+	luci.template.render("nsclient/main", {
+		status_cache_json = read_status_cache_json()
+	})
 end
 
 function action_status()
@@ -125,6 +151,7 @@ function action_save()
 	local password = valid_password(http.formvalue("password"))
 	local enable = scrub(http.formvalue("enable") or "")
 	local region = valid_region(http.formvalue("region"))
+	local split = valid_split(http.formvalue("split") or "")
 
 	if account then
 		if password then
@@ -135,6 +162,9 @@ function action_save()
 	end
 	if enable ~= "" then
 		sys.call("/usr/sbin/nsclient set enable " .. sh_quote(enable) .. " >/dev/null")
+	end
+	if split then
+		sys.call("/usr/sbin/nsclient set split " .. sh_quote(split) .. " >/dev/null")
 	end
 	if region then
 		sys.call("/usr/sbin/nsclient set region " .. sh_quote(region) .. " >/dev/null")
@@ -160,8 +190,17 @@ function action_login()
 		sys.call("/usr/sbin/nsclient set enable " .. sh_quote(enable) .. " >/dev/null")
 	end
 
+	-- Login may disconnect the old tunnel (account switch) then wait on
+	-- HTTPS; that exceeds uhttpd idle timeout. Return immediately and
+	-- let the page poll status.login_pending / login_result.
+	os.execute("mkdir -p /var/run/nsclient; echo pending > /var/run/nsclient/login.job; rm -f /var/run/nsclient/login.result; /usr/sbin/nsclient login >/dev/null 2>&1 &")
 	http.prepare_content("application/json")
-	http.write_json(run_json("/usr/sbin/nsclient login"))
+	http.write_json({
+		ok = true,
+		pending = true,
+		msg = "正在登录",
+		account = account or ""
+	})
 end
 
 function action_connect()
@@ -169,8 +208,18 @@ function action_connect()
 	if region then
 		sys.call("/usr/sbin/nsclient set region " .. sh_quote(region) .. " >/dev/null")
 	end
+	-- Handshake can take longer than uhttpd's idle timeout. Start it in the
+	-- background and let the page poll status; otherwise LuCI shows
+	-- "无有效响应" while the tunnel is still coming up.
+	os.execute("/usr/sbin/nsclient connect " .. sh_quote(region or "") ..
+		" >/dev/null 2>&1 &")
 	http.prepare_content("application/json")
-	http.write_json(run_json("/usr/sbin/nsclient connect " .. sh_quote(region or "")))
+	http.write_json({
+		ok = true,
+		pending = true,
+		msg = "正在连接",
+		region = region or ""
+	})
 end
 
 function action_disconnect()

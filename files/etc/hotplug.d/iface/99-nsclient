@@ -1,0 +1,28 @@
+#!/bin/sh
+# Re-apply reserved-address routes after WAN/WG ifup, and start the
+# tunnel only after WAN is up. netifd must not auto-start nsclient
+# (auto=0): /1 routes would swallow the handshake before the endpoint
+# is pinned via WAN.
+
+[ "$ACTION" = ifup ] || [ "$ACTION" = ifupdate ] || exit 0
+
+enable=$(uci -q get nsclient.main.enable)
+want=$(uci -q get nsclient.main.want)
+
+should_autostart() {
+	[ "$want" = "1" ] && return 0
+	[ "$enable" = "1" ] && [ "$want" != "0" ]
+}
+
+case "$INTERFACE" in
+	wan|wan6)
+		if [ -d /sys/class/net/nsclient ]; then
+			/usr/sbin/nsclient routes >/dev/null 2>&1 &
+		elif should_autostart; then
+			/usr/sbin/nsclient autostart >/dev/null 2>&1 &
+		fi
+		;;
+	nsclient)
+		/usr/sbin/nsclient routes >/dev/null 2>&1 &
+		;;
+esac

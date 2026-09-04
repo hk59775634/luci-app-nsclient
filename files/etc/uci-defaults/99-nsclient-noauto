@@ -1,0 +1,5 @@
+#!/bin/sh
+[ "$(uci -q get network.nsclient.proto)" = wireguard ] || exit 0
+uci -q set network.nsclient.auto=0
+uci commit network
+exit 0

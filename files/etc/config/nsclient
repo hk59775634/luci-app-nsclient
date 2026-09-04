@@ -1,5 +1,6 @@
 config nsclient 'main'
 	option enable '0'
+	option split '1'
 	option orch_url 'https://orch.one.netsignory.net'
 	option domain 'client.one.netsignory.net'
 	option account ''

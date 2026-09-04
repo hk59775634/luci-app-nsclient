@@ -1,0 +1,11 @@
+#!/bin/sh /etc/rc.common
+# Before /etc/init.d/network (START=20): never let netifd auto-start
+# the WireGuard client. Handshake UDP must leave via WAN.
+
+START=19
+
+start() {
+	[ "$(uci -q get network.nsclient.proto)" = wireguard ] || return 0
+	uci -q set network.nsclient.auto=0
+	uci commit network
+}

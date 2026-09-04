@@ -44,6 +44,30 @@ make package/luci-app-nsclient/compile V=s
 
 登录时会先尝试 HTTPS；若本机旧版 wolfSSL/OpenSSL 1.1 无法与编排站完成握手，自动改走 HTTP。系统时间早于 2025 时会先用 NTP 校时。
 
+## Release
+
+GitHub Release 同时发布 NS Client 软件包和对应设备固件：
+
+https://github.com/hk59775634/luci-app-nsclient/releases
+
+每个 Release 包含：
+
+| 文件 | 说明 |
+|---|---|
+| `manifest.json` | 版本清单，路由器更新页读取 |
+| `luci-app-nsclient_*-1_all.ipk` | NS Client 软件包 |
+| `*-squashfs-sysupgrade.bin` | MT7981 可升级固件 |
+
+路由器 **更新** 页会检测 latest release，可单独更新 NS Client 或整包固件。
+
+## 分流
+
+默认 **分流**：中国大陆 IP（[chnroutes](https://github.com/hk59775634/chnroutes) IPv4）走 WAN，其余走隧道。可改为 **全局**（全部公网走隧道）。
+
+路由表优先从 GitHub / jsDelivr / ghproxy 更新；失败时使用软件包内置回退列表。
+
+DNS 使用本机已打补丁的 dnsmasq `chnroutes` 模式：国内走 WAN 原始 DNS 或 `180.76.76.76`，海外走 API 下发的 DNS。
+
 ## 命令
 
 ```

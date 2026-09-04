@@ -6,11 +6,30 @@ UCI_SEC=main
 IFNAME=nsclient
 STATE_DIR=/var/run/nsclient
 LOGIN_JSON="$STATE_DIR/login.json"
+STATUS_JSON="$STATE_DIR/status.json"
+EXIT_IP_FILE="$STATE_DIR/exit_ip"
 LOCK=/var/lock/nsclient.lock
+BLOCK_FILE="$STATE_DIR/block"
+LOGIN_FAIL="$STATE_DIR/login_fail"
+LOGIN_JOB="$STATE_DIR/login.job"
+LOGIN_RESULT="$STATE_DIR/login.result"
+BOUND_ACCOUNT="$STATE_DIR/bound_account"
+WATCH_SLEEP=30
+LOGIN_REFRESH=300
+HANDSHAKE_DEAD=180
 LOGIN_PATH=/api/router/login
 FW_ORCH=nsc_orch
 FW_DOMAIN=nsc_domain
 DEFAULT_ORCH=https://orch.one.netsignory.net
+WG_FWMARK=0xca6c
+WG_TABLE=51820
+WG_RULE_PREF=1004
+CHN_FALLBACK=/usr/share/nsclient/chnroutes-v4
+CHN_FILE=/etc/nsclient/chnroutes-v4
+CHN_TABLE=51821
+CHN_RULE_PREF=1005
+CHN_DNS_FALLBACK=180.76.76.76
+CHN_FETCH_MAXAGE=86400
 
 . /lib/functions.sh 2>/dev/null || true
 
@@ -227,6 +246,25 @@ set_enable() {
 		*) uci_set enable 0 ;;
 	esac
 	uci commit "$UCI_PKG"
+	write_status_cache &
+}
+
+split_enabled() {
+	case "$(uci_get split)" in
+		0|off|false|no) return 1 ;;
+		*) return 0 ;;
+	esac
+}
+
+set_split() {
+	ensure_uci
+	case "$1" in
+		0|off|false|no|global) uci_set split 0 ;;
+		*) uci_set split 1 ;;
+	esac
+	uci commit "$UCI_PKG"
+	write_status_cache &
+	if_up && (apply_runtime_policy) >/dev/null 2>&1 &
 }
 
 mkdir_state() {
@@ -234,17 +272,170 @@ mkdir_state() {
 	chmod 700 "$STATE_DIR"
 }
 
+set_block() {
+	mkdir_state
+	printf '%s' "$1" > "$BLOCK_FILE"
+	log "blocked: $1"
+}
+
+clear_block() {
+	rm -f "$BLOCK_FILE"
+}
+
+block_reason() {
+	cat "$BLOCK_FILE" 2>/dev/null || true
+}
+
+set_login_fail() {
+	mkdir_state
+	printf '%s' "$1" > "$LOGIN_FAIL"
+}
+
+clear_login_fail() {
+	rm -f "$LOGIN_FAIL"
+}
+
+login_fail_reason() {
+	cat "$LOGIN_FAIL" 2>/dev/null || true
+}
+
+set_want() {
+	ensure_uci
+	uci_set want "$1"
+	uci commit "$UCI_PKG"
+}
+
+wanted() {
+	[ "$(uci_get want)" = "1" ]
+}
+
+account_expired() {
+	local exp now
+	exp=$(trim "$1")
+	[ -n "$exp" ] && [ "$exp" != "null" ] && [ "$exp" -gt 0 ] 2>/dev/null || return 1
+	now=$(date +%s)
+	[ "$now" -ge "$exp" ]
+}
+
+cached_expired_time() {
+	local exp
+	exp=$(uci_get expired_time)
+	if [ -z "$exp" ] || [ "$exp" = "0" ]; then
+		[ -s "$LOGIN_JSON" ] && exp=$(jq -r '.data.expired_time // 0' "$LOGIN_JSON")
+	fi
+	printf '%s' "$exp"
+}
+
+login_occupied() {
+	local st
+	st=$(trim "$1")
+	[ -n "$st" ] || st=0
+	[ "$st" != "0" ]
+}
+
+mark_login_ok() {
+	mkdir_state
+	date +%s > "$STATE_DIR/last_login"
+}
+
+last_login_age() {
+	local ts now
+	ts=$(cat "$STATE_DIR/last_login" 2>/dev/null) || ts=0
+	[ "$ts" -gt 0 ] 2>/dev/null || { echo 999999; return 1; }
+	now=$(date +%s)
+	echo $((now - ts))
+}
+
+login_finish() {
+	local json="$1" rc="${2:-0}"
+	if [ "$NSC_REFRESH" != "1" ] && [ "$NSC_INNER" != "1" ]; then
+		mkdir_state
+		printf '%s\n' "$json" > "$LOGIN_RESULT"
+		chmod 600 "$LOGIN_RESULT" 2>/dev/null || true
+		rm -f "$LOGIN_JOB"
+	fi
+	json_out "$json"
+	return "$rc"
+}
+
+cached_login_account() {
+	[ -s "$LOGIN_JSON" ] || return 0
+	jq -r '.data.account // empty | split("/")[0]' "$LOGIN_JSON"
+}
+
+bound_account() {
+	cat "$BOUND_ACCOUNT" 2>/dev/null || true
+}
+
+save_bound_account() {
+	mkdir_state
+	printf '%s' "$1" > "$BOUND_ACCOUNT"
+}
+
+tunnel_key_in_login() {
+	local priv
+	priv=$(uci -q get "network.${IFNAME}.private_key")
+	[ -n "$priv" ] || return 1
+	[ -s "$LOGIN_JSON" ] || return 1
+	jq -e --arg k "$priv" '.data.wg_tunnels[]? | select(.private_key==$k)' "$LOGIN_JSON" >/dev/null 2>&1
+}
+
+# 当前 WG 会话是否已经绑在这个账号的密钥上
+session_belongs_to() {
+	local acc="$1" bound json
+	acc=$(trim "$acc")
+	[ -n "$acc" ] || return 1
+	if_up || return 1
+	bound=$(bound_account)
+	if [ -n "$bound" ]; then
+		[ "$bound" = "$acc" ]
+		return $?
+	fi
+	json=$(cached_login_account)
+	[ "$json" = "$acc" ] && tunnel_key_in_login
+}
+
+should_drop_for_account() {
+	local acc="$1" json
+	acc=$(trim "$acc")
+	json=$(cached_login_account)
+	if if_up; then
+		session_belongs_to "$acc" && return 1
+		return 0
+	fi
+	[ -n "$json" ] && [ "$json" != "$acc" ]
+}
+
+drop_old_session() {
+	local new="$1" keep_want="$2"
+	log "account switch -> $new, drop old tunnel"
+	if if_up; then
+		KEEP_WANT=1
+		KEEP_BLOCK=1
+		disconnect >/dev/null
+		KEEP_WANT=
+		KEEP_BLOCK=
+	fi
+	rm -f "$LOGIN_JSON" "$BOUND_ACCOUNT"
+	if [ "$keep_want" = "1" ]; then
+		set_want 1
+	else
+		set_want 0
+	fi
+}
+
 login() {
 	local orch domain account password body resp code msg
+	local login_st exp tun_n was_up=0 reconnect=0 region
 	orch=$(orch_url)
 	domain=$(agent_domain) || {
-		json_out '{"ok":false,"code":0,"msg":"未配置代理识别域名"}'
+		login_finish '{"ok":false,"code":0,"msg":"未配置代理识别域名"}' 1
 		return 1
 	}
 	account=$(normalize_account "${1:-$(uci_get account)}") || account=""
 	password=$(normalize_password "${2:-$(uci_get password)}") || password=""
 	if [ -z "$account" ] || [ -z "$password" ]; then
-		json_out '{"ok":false,"code":0,"msg":"请先填写账号和密码"}'
+		login_finish '{"ok":false,"code":0,"msg":"请先填写账号和密码"}' 1
 		return 1
 	fi
 
@@ -253,21 +444,34 @@ login() {
 	uci_set password "$password"
 	uci commit "$UCI_PKG"
 
+	if_up && was_up=1
+	wanted && reconnect=1
+	[ "$was_up" = "1" ] && reconnect=1
+
 	mkdir_state
+	if [ "$NSC_REFRESH" != "1" ] && [ "$NSC_INNER" != "1" ]; then
+		printf '%s\t%s\n' "$(date +%s)" "$account" > "$LOGIN_JOB"
+		rm -f "$LOGIN_RESULT"
+	fi
+	if should_drop_for_account "$account"; then
+		drop_old_session "$account" "$reconnect"
+	fi
 	body=$(jq -nc --arg d "$domain" --arg a "$account" --arg p "$password" \
 		'{domain:$d,account:$a,password:$p}') || {
-		json_out '{"ok":false,"code":0,"msg":"无法构造登录请求"}'
+		login_finish '{"ok":false,"code":0,"msg":"无法构造登录请求"}' 1
 		return 1
 	}
 
 	resp=$(curl_post_json "${orch}${LOGIN_PATH}" "$body" 2>"$STATE_DIR/curl.err") || {
 		msg=$(tr '\n' ' ' < "$STATE_DIR/curl.err" 2>/dev/null)
-		json_out "$(jq -nc --arg m "登录请求失败: ${msg:-network error}" '{ok:false,code:0,msg:$m}')"
+		set_login_fail network
+		login_finish "$(jq -nc --arg m "登录请求失败: ${msg:-network error}" '{ok:false,code:0,msg:$m}')" 1
 		return 1
 	}
 
 	printf '%s' "$resp" | jq -e . >/dev/null 2>&1 || {
-		json_out '{"ok":false,"code":0,"msg":"服务器返回了无法解析的数据"}'
+		set_login_fail network
+		login_finish '{"ok":false,"code":0,"msg":"服务器返回了无法解析的数据"}' 1
 		return 1
 	}
 
@@ -275,19 +479,74 @@ login() {
 	msg=$(printf '%s' "$resp" | jq -r '.msg // empty')
 	if [ "$code" != "200" ]; then
 		[ -n "$msg" ] || msg="登录失败"
-		json_out "$(jq -nc --argjson c "$code" --arg m "$msg" '{ok:false,code:$c,msg:$m}')"
+		# Periodic refresh: treat API business errors as disabled/revoked.
+		# A user typing the wrong password must not tear the tunnel down.
+		if [ "$NSC_REFRESH" = "1" ]; then
+			set_login_fail account
+			set_block "$msg"
+			rm -f "$LOGIN_JSON"
+		fi
+		login_finish "$(jq -nc --argjson c "$code" --arg m "$msg" '{ok:false,code:$c,msg:$m}')" 1
 		return 1
 	fi
 
+	login_st=$(printf '%s' "$resp" | jq -r '.data.login_status // 0')
+	[ -n "$login_st" ] || login_st=0
+	if login_occupied "$login_st"; then
+		set_login_fail occupied
+		set_block "账号已在其他设备登录"
+		rm -f "$LOGIN_JSON"
+		login_finish "$(jq -nc --arg s "$login_st" '{ok:false,code:200,login_status:$s,msg:"账号已在其他设备登录，请勿重复登录"}')" 1
+		write_status_cache &
+		return 1
+	fi
+
+	exp=$(printf '%s' "$resp" | jq -r '.data.expired_time // 0')
+	if account_expired "$exp"; then
+		set_login_fail expired
+		set_block "账号已到期"
+		rm -f "$LOGIN_JSON"
+		login_finish '{"ok":false,code:200,msg:"账号已到期"}' 1
+		write_status_cache &
+		return 1
+	fi
+
+	tun_n=$(printf '%s' "$resp" | jq -r '.data.wg_tunnels | length')
+	if [ "$tun_n" = "0" ] || [ "$tun_n" = "null" ]; then
+		set_login_fail account
+		set_block "账号已禁用或没有可用节点"
+		rm -f "$LOGIN_JSON"
+		login_finish '{"ok":false,code:200,msg:"账号已禁用或没有可用节点"}' 1
+		write_status_cache &
+		return 1
+	fi
+
+	clear_login_fail
+	clear_block
 	printf '%s' "$resp" > "$LOGIN_JSON"
 	chmod 600 "$LOGIN_JSON"
-	log "login ok account=$(printf '%s' "$resp" | jq -r '.data.account // empty')"
-	json_out "$(printf '%s' "$resp" | jq -c '{ok:true,code:.code,msg:.msg,account:(.data.account|tostring|split("/")[0]),expired_time:.data.expired_time,nodes:[.data.wg_tunnels[]? | {region}]}')"
+	uci_set expired_time "$exp"
+	uci commit "$UCI_PKG"
+	mark_login_ok
+	log "login ok account=$(printf '%s' "$resp" | jq -r '.data.account // empty') login_status=$login_st"
+	if [ "$NSC_REFRESH" != "1" ] && [ "$NSC_INNER" != "1" ] && [ "$reconnect" = "1" ]; then
+		region=$(normalize_region "$(uci_get region)") || region=""
+		set_want 1
+		NSC_SKIP_LOGIN=1 connect "$region" >/dev/null || \
+			log "account switch login ok, reconnect failed"
+	fi
+	login_finish "$(printf '%s' "$resp" | jq -c '{ok:true,code:.code,msg:.msg,login_status:(.data.login_status // 0),account:(.data.account|tostring|split("/")[0]),expired_time:.data.expired_time,nodes:[.data.wg_tunnels[]? | {region}]}')" 0
+	write_status_cache &
 }
 
 need_login() {
+	local st exp
 	[ -s "$LOGIN_JSON" ] || return 0
 	jq -e '.data.wg_tunnels | type=="array" and length>0' "$LOGIN_JSON" >/dev/null 2>&1 || return 0
+	st=$(jq -r '.data.login_status // 0' "$LOGIN_JSON")
+	login_occupied "$st" && return 0
+	exp=$(jq -r '.data.expired_time // 0' "$LOGIN_JSON")
+	account_expired "$exp" && return 0
 	return 1
 }
 
@@ -305,9 +564,90 @@ tunnel_of() {
 clean_wg_uci() {
 	uci -q delete network."$IFNAME"
 	uci -q delete network."${IFNAME}_peer"
+	uci -q delete network."${IFNAME}_ep"
 	while uci -q delete "network.@wireguard_${IFNAME}[0]" 2>/dev/null; do
 		:
 	done
+}
+
+wan_logical() {
+	uci -q get network.wan >/dev/null 2>&1 && { printf '%s' wan; return 0; }
+	printf '%s' wan
+}
+
+ensure_endpoint_uci_route() {
+	local sip gw ifc
+	sip=$(trim "$1")
+	gw=$(trim "$2")
+	ifc=$(wan_logical)
+	echo "$sip" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' || return 0
+	uci -q set "network.${IFNAME}_ep=route"
+	uci -q set "network.${IFNAME}_ep.interface=$ifc"
+	uci -q set "network.${IFNAME}_ep.target=$sip"
+	uci -q set "network.${IFNAME}_ep.netmask=255.255.255.255"
+	[ -n "$gw" ] && uci -q set "network.${IFNAME}_ep.gateway=$gw"
+}
+
+ensure_wg_mark_table() {
+	local gw dev
+	gw=$(trim "$1")
+	dev=$(wan_dev)
+	[ -n "$gw" ] || gw=$(wan_gw)
+	[ -n "$gw" ] || return 0
+	[ -n "$dev" ] || return 0
+	ip route replace default via "$gw" dev "$dev" table "$WG_TABLE" 2>/dev/null || true
+	ip rule del pref "$WG_RULE_PREF" 2>/dev/null || true
+	ip rule del pref 51820 2>/dev/null || true
+	ip rule add fwmark "$WG_FWMARK" lookup "$WG_TABLE" pref "$WG_RULE_PREF" 2>/dev/null || true
+}
+
+clear_wg_mark_table() {
+	ip rule del pref "$WG_RULE_PREF" 2>/dev/null || true
+	ip rule del pref 51820 2>/dev/null || true
+	ip route flush table "$WG_TABLE" 2>/dev/null || true
+}
+
+pin_tunnel_prefix() {
+	local addr a b
+	addr=$(uci -q get "network.${IFNAME}.addresses")
+	addr=${addr%%/*}
+	addr=${addr%% *}
+	a=$(printf '%s' "$addr" | cut -d. -f1)
+	b=$(printf '%s' "$addr" | cut -d. -f2)
+	echo "$a" | grep -qE '^[0-9]+$' || return 0
+	echo "$b" | grep -qE '^[0-9]+$' || return 0
+	ip route replace "$a.$b.0.0/16" dev "$IFNAME" 2>/dev/null || true
+}
+
+flush_wg_conntrack() {
+	local sip port
+	sip=$(uci -q get "network.${IFNAME}_peer.endpoint_host")
+	port=$(uci -q get "network.${IFNAME}_peer.endpoint_port")
+	[ -n "$port" ] || port=51820
+	command -v conntrack >/dev/null 2>&1 || return 0
+	conntrack -D -p udp --dport "$port" >/dev/null 2>&1 || true
+	[ -n "$sip" ] && conntrack -D -p udp --dst "$sip" >/dev/null 2>&1 || true
+}
+
+wait_handshake() {
+	local i=0
+	while [ "$i" -lt 12 ]; do
+		handshake_age >/dev/null 2>&1 && return 0
+		sleep 1
+		i=$((i + 1))
+	done
+	return 1
+}
+
+run_locked() {
+	mkdir -p /var/lock
+	(
+		flock 9 || {
+			log "lock failed"
+			exit 1
+		}
+		"$@"
+	) 9>"$LOCK"
 }
 
 ensure_wan_zone() {
@@ -416,19 +756,418 @@ curl_post_json() {
 	curl_one "$url" "$body" 15
 }
 
+wan_dev() {
+	local d
+	d=$(ip -4 route show default 2>/dev/null | awk '/via/ && $0 !~ /nsclient/ {for (i = 1; i <= NF; i++) if ($i == "dev") { print $(i + 1); exit }}')
+	[ -n "$d" ] && { printf '%s' "$d"; return 0; }
+	printf '%s' eth1
+}
+
 wan_gw() {
-	ip -4 route show default 2>/dev/null | awk '/via/ && /eth1/ {print $3; exit}'
+	ip -4 route show default 2>/dev/null | awk '/via/ && $0 !~ /nsclient/ {print $3; exit}'
 }
 
 pin_host_via_wan() {
-	local host ip gw
+	local host ip gw dev
 	host=$(trim "$1")
 	gw=$(trim "$2")
+	dev=$(wan_dev)
 	[ -n "$host" ] || return 0
 	[ -n "$gw" ] || gw=$(wan_gw)
 	[ -n "$gw" ] || return 0
 	ip=$(resolve_ipv4 "$host") || return 0
-	ip route replace "$ip/32" via "$gw" dev eth1 2>/dev/null || true
+	ip route replace "$ip/32" via "$gw" dev "$dev" 2>/dev/null || true
+}
+
+# IANA IPv4 special-purpose / reserved. More specific than /1, so they
+# stay on local interfaces (connected LAN/WAN win by LPM; the rest use WAN).
+reserved_unicast() {
+	printf '%s\n' \
+		10.0.0.0/8 \
+		100.64.0.0/10 \
+		169.254.0.0/16 \
+		172.16.0.0/12 \
+		192.0.0.0/24 \
+		192.0.2.0/24 \
+		192.88.99.0/24 \
+		192.168.0.0/16 \
+		198.18.0.0/15 \
+		198.51.100.0/24 \
+		203.0.113.0/24
+}
+
+reserved_localonly() {
+	printf '%s\n' \
+		0.0.0.0/8 \
+		224.0.0.0/4 \
+		240.0.0.0/4 \
+		255.255.255.255/32
+}
+
+pin_reserved_local() {
+	local gw dev p
+	gw=$(trim "$1")
+	dev=$(wan_dev)
+	[ -n "$gw" ] || gw=$(wan_gw)
+	[ -n "$gw" ] || gw=10.254.0.1
+	[ -n "$dev" ] || dev=eth1
+
+	# Unicast reserved: keep off the tunnel. Link-local stays on the WAN NIC;
+	# other reserved uses the WAN gateway. br-lan / WAN connected routes win.
+	for p in $(reserved_unicast); do
+		case "$p" in
+			169.254.0.0/16)
+				ip route replace "$p" dev "$dev" proto static scope link 2>/dev/null || true
+				;;
+			*)
+				ip route replace "$p" via "$gw" dev "$dev" 2>/dev/null || true
+				;;
+		esac
+	done
+	for p in $(reserved_localonly); do
+		case "$p" in
+			224.0.0.0/4)
+				ip route replace "$p" dev br-lan proto static 2>/dev/null || \
+					ip route replace "$p" dev lo proto static 2>/dev/null || true
+				;;
+			*)
+				ip route replace "$p" dev lo proto static 2>/dev/null || true
+				;;
+		esac
+	done
+	sysctl -q -w "net.ipv4.conf.${dev}.send_redirects=0" 2>/dev/null || true
+}
+
+unpin_reserved_local() {
+	local p
+	for p in $(reserved_unicast) $(reserved_localonly); do
+		ip route del "$p" 2>/dev/null || true
+	done
+}
+
+chnroutes_count() {
+	local n
+	n=$(grep -cE '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+/[0-9]+$' "$1" 2>/dev/null)
+	[ -n "$n" ] || n=0
+	printf '%s' "$n"
+}
+
+chnroutes_valid() {
+	local n
+	n=$(chnroutes_count "$1")
+	[ "$n" -ge 100 ] 2>/dev/null
+}
+
+ensure_chnroutes_file() {
+	mkdir -p /etc/nsclient
+	if chnroutes_valid "$CHN_FILE"; then
+		return 0
+	fi
+	if chnroutes_valid "$CHN_FALLBACK"; then
+		cp "$CHN_FALLBACK" "$CHN_FILE" 2>/dev/null || return 1
+		log "chnroutes using bundled fallback ($(chnroutes_count "$CHN_FILE") prefixes)"
+		return 0
+	fi
+	return 1
+}
+
+china_dns() {
+	local d
+	d=$(awk '/^nameserver[ \t]+[0-9]/{print $2}' \
+		/tmp/resolv.conf.d/resolv.conf.auto \
+		/tmp/resolv.conf.auto 2>/dev/null \
+		| grep -vE '^(127\.|0\.)' | awk 'NF && !a[$0]++ {print; exit}')
+	[ -n "$d" ] && { printf '%s' "$d"; return 0; }
+	printf '%s' "$CHN_DNS_FALLBACK"
+}
+
+overseas_dns() {
+	local d
+	d=$(upstream_dns_list | awk '/^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/{print; exit}')
+	[ -n "$d" ] && { printf '%s' "$d"; return 0; }
+	printf '%s' 8.8.8.8
+}
+
+dnsmasq_supports_chnroutes() {
+	dnsmasq --help 2>&1 | grep -q chnroutes
+}
+
+setup_chn_table() {
+	mkdir -p /etc/iproute2
+	if [ -f /etc/iproute2/rt_tables ]; then
+		grep -qE "^${CHN_TABLE}[[:space:]]" /etc/iproute2/rt_tables 2>/dev/null || \
+			echo "${CHN_TABLE}	nsc_cn" >> /etc/iproute2/rt_tables
+	fi
+}
+
+ensure_chn_rule() {
+	setup_chn_table
+	ip rule del pref 51821 2>/dev/null || true
+	ip rule show pref "$CHN_RULE_PREF" 2>/dev/null | grep -q "lookup" && return 0
+	ip rule del pref "$CHN_RULE_PREF" 2>/dev/null || true
+	ip rule add pref "$CHN_RULE_PREF" lookup "$CHN_TABLE" 2>/dev/null || true
+}
+
+clear_split_routes() {
+	ip rule del pref "$CHN_RULE_PREF" 2>/dev/null || true
+	ip rule del pref 51821 2>/dev/null || true
+	ip route flush table "$CHN_TABLE" 2>/dev/null || true
+	rm -f "$STATE_DIR/chn_routes.stamp"
+}
+
+apply_split_routes() {
+	local gw dev batch stamp cur
+	split_enabled || { clear_split_routes; return 0; }
+	ensure_chnroutes_file || { log "chnroutes file missing"; return 1; }
+	gw=$(trim "$1")
+	dev=$(wan_dev)
+	[ -n "$gw" ] || gw=$(wan_gw)
+	[ -n "$gw" ] || return 1
+	[ -n "$dev" ] || return 1
+	ensure_chn_rule
+	stamp=$(md5sum "$CHN_FILE" 2>/dev/null | awk '{print $1}')
+	stamp="${stamp}_${gw}_${dev}"
+	cur=$(cat "$STATE_DIR/chn_routes.stamp" 2>/dev/null)
+	if [ "$stamp" = "$cur" ]; then
+		[ "$(ip route show table "$CHN_TABLE" 2>/dev/null | grep -cE '^[0-9]')" -ge 100 ] 2>/dev/null && return 0
+	fi
+	batch=/tmp/nsclient-chn.batch
+	awk -v gw="$gw" -v dev="$dev" -v tid="$CHN_TABLE" '
+		/^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+\/[0-9]+$/ {
+			printf "route replace %s via %s dev %s table %s\n", $1, gw, dev, tid
+		}' "$CHN_FILE" > "$batch"
+	ip route flush table "$CHN_TABLE" 2>/dev/null || true
+	ip -batch "$batch" 2>/dev/null || {
+		log "chnroutes ip -batch failed"
+		return 1
+	}
+	mkdir_state
+	echo "$stamp" > "$STATE_DIR/chn_routes.stamp"
+	log "chnroutes applied $(chnroutes_count "$CHN_FILE") prefixes via $gw dev $dev"
+}
+
+chnroutes_fetch_urls() {
+	local raw cdn
+	raw="https://raw.githubusercontent.com/hk59775634/chnroutes/main/chnroutes-v4"
+	cdn="https://cdn.jsdelivr.net/gh/hk59775634/chnroutes@main/chnroutes-v4"
+	printf '%s\n' \
+		"$raw" \
+		"$cdn" \
+		"https://ghproxy.net/${raw}" \
+		"https://gh-proxy.com/${raw}" \
+		"https://mirror.ghproxy.com/${raw}" \
+		"https://ghps.cc/${raw}"
+}
+
+fetch_chnroutes() {
+	local url tmp wanif now age
+	ensure_chnroutes_file || true
+	now=$(date +%s)
+	if [ -f "$CHN_FILE" ]; then
+		age=$((now - $(date -r "$CHN_FILE" +%s 2>/dev/null || echo 0)))
+		if chnroutes_valid "$CHN_FILE" && [ "$age" -ge 0 ] && [ "$age" -lt "$CHN_FETCH_MAXAGE" ] && \
+			[ -f "$STATE_DIR/chn_fetch.ok" ]; then
+			return 0
+		fi
+	fi
+	tmp="/tmp/nsclient-chn.$$.dl"
+	wanif=$(wan_dev)
+	for url in $(chnroutes_fetch_urls); do
+		if curl -fsSL --http1.1 --connect-timeout 8 --max-time 25 \
+			${wanif:+--interface "$wanif"} \
+			-o "$tmp" "$url" 2>/dev/null && chnroutes_valid "$tmp"; then
+			mkdir -p /etc/nsclient
+			if [ -f "$CHN_FILE" ] && cmp -s "$tmp" "$CHN_FILE"; then
+				touch "$CHN_FILE"
+				rm -f "$tmp"
+			else
+				mv -f "$tmp" "$CHN_FILE"
+				rm -f "$STATE_DIR/chn_routes.stamp"
+			fi
+			mkdir_state
+			date +%s > "$STATE_DIR/chn_fetch.ok"
+			log "chnroutes updated from $url ($(chnroutes_count "$CHN_FILE") prefixes)"
+			return 0
+		fi
+		rm -f "$tmp"
+	done
+	ensure_chnroutes_file
+	log "chnroutes fetch failed, using $(chnroutes_valid "$CHN_FILE" && echo local || echo none)"
+	return 1
+}
+
+maybe_update_chnroutes() {
+	split_enabled || return 0
+	mkdir_state
+	[ -f "$STATE_DIR/chn_fetch.pid" ] && kill -0 "$(cat "$STATE_DIR/chn_fetch.pid")" 2>/dev/null && return 0
+	(
+		echo $$ > "$STATE_DIR/chn_fetch.pid"
+		if fetch_chnroutes; then
+			if_up && apply_split_routes "$(wan_gw)"
+			if_up && apply_upstream_dns
+		fi
+		rm -f "$STATE_DIR/chn_fetch.pid"
+	) >/dev/null 2>&1 &
+}
+
+save_tunnel_meta() {
+	local d
+	mkdir_state
+	printf '%s' "$1" > "$STATE_DIR/endpoint_host"
+	printf '%s\n' "$2" > "$STATE_DIR/upstream_dns"
+	uci -q delete "${UCI_PKG}.${UCI_SEC}.dns"
+	for d in $2; do
+		d=$(trim "$d")
+		[ -n "$d" ] && uci -q add_list "${UCI_PKG}.${UCI_SEC}.dns=$d"
+	done
+	uci commit "$UCI_PKG"
+}
+
+upstream_dns_list() {
+	local d
+	if [ -s "$STATE_DIR/upstream_dns" ]; then
+		cat "$STATE_DIR/upstream_dns"
+		return 0
+	fi
+	for d in $(uci -q get "${UCI_PKG}.${UCI_SEC}.dns" 2>/dev/null); do
+		printf '%s\n' "$d"
+	done
+}
+
+dns_section() {
+	uci -q get dhcp.@dnsmasq[0] >/dev/null 2>&1 && echo '@dnsmasq[0]'
+}
+
+strip_dhcp_nsclient_dns() {
+	local d sec
+	sec=$(dns_section) || return 0
+	for d in $(uci -q get "${UCI_PKG}.${UCI_SEC}.dns" 2>/dev/null); do
+		uci -q del_list "dhcp.${sec}.server=$d"
+	done
+}
+
+dns_fingerprint() {
+	if split_enabled && if_up && dnsmasq_supports_chnroutes; then
+		printf 'split %s %s %s' "$(china_dns)" "$(overseas_dns)" \
+			"$(md5sum "$CHN_FILE" 2>/dev/null | awk '{print $1}')"
+	else
+		printf 'global '
+		upstream_dns_list | awk 'NF' | sort -u | tr '\n' ' '
+	fi
+}
+
+reassert_local_resolv() {
+	if [ -L /tmp/resolv.conf ] || ! grep -q '127.0.0.1' /tmp/resolv.conf 2>/dev/null; then
+		rm -f /tmp/resolv.conf
+		printf 'search lan\nnameserver 127.0.0.1\n' > /tmp/resolv.conf
+	fi
+}
+
+dnsmasq_apply() {
+	if [ "$1" = restart ]; then
+		/etc/init.d/dnsmasq restart >/dev/null 2>&1 || true
+	else
+		/etc/init.d/dnsmasq reload >/dev/null 2>&1 || killall -HUP dnsmasq 2>/dev/null || true
+	fi
+	reassert_local_resolv
+}
+
+apply_upstream_dns() {
+	local d sec conf fp local_d remote_d how
+	sec=$(dns_section) || sec='@dnsmasq[0]'
+	conf=/tmp/dnsmasq.d/nsclient.conf
+	fp=$(dns_fingerprint)
+	if [ -n "$fp" ] && [ -s "$conf" ] && [ "$(cat "$STATE_DIR/dns_fp" 2>/dev/null)" = "$fp" ]; then
+		return 0
+	fi
+	mkdir -p /tmp/dnsmasq.d "$STATE_DIR"
+	strip_dhcp_nsclient_dns
+
+	if split_enabled && if_up && dnsmasq_supports_chnroutes && ensure_chnroutes_file; then
+		local_d=$(china_dns)
+		remote_d=$(overseas_dns)
+		: > /tmp/resolv.conf.auto
+		cat > "$conf" <<EOF
+# nsclient split DNS: China ${local_d} / overseas ${remote_d}
+no-resolv
+all-servers
+server=${local_d},0
+server=${remote_d},1
+chnroutes-file=${CHN_FILE}
+EOF
+		how=restart
+		log "dns split china=${local_d} overseas=${remote_d}"
+	else
+		: > "$conf"
+		: > /tmp/resolv.conf.auto
+		for d in $(upstream_dns_list); do
+			d=$(trim "$d")
+			case "$d" in
+				[0-9]*.[0-9]*.[0-9]*.[0-9]*)
+					echo "nameserver $d" >> /tmp/resolv.conf.auto
+					echo "server=$d" >> "$conf"
+					uci -q add_list "dhcp.${sec}.server=$d"
+					;;
+			esac
+		done
+		if [ ! -s /tmp/resolv.conf.auto ]; then
+			rm -f "$conf"
+		fi
+		how=restart
+	fi
+	uci commit dhcp 2>/dev/null || true
+	dnsmasq_apply "$how"
+	printf '%s' "$fp" > "$STATE_DIR/dns_fp"
+}
+
+clear_upstream_dns() {
+	local sec
+	sec=$(dns_section) || sec='@dnsmasq[0]'
+	strip_dhcp_nsclient_dns
+	uci commit dhcp 2>/dev/null || true
+	rm -f /tmp/dnsmasq.d/nsclient.conf "$STATE_DIR/dns_fp"
+	if [ -s /tmp/resolv.conf.d/resolv.conf.auto ]; then
+		grep -E '^nameserver|^search' /tmp/resolv.conf.d/resolv.conf.auto \
+			> /tmp/resolv.conf.auto 2>/dev/null || : > /tmp/resolv.conf.auto
+	else
+		: > /tmp/resolv.conf.auto
+	fi
+	/etc/init.d/dnsmasq reload >/dev/null 2>&1 || killall -HUP dnsmasq 2>/dev/null || true
+	reassert_local_resolv
+}
+
+apply_runtime_policy() {
+	local gw sip
+	if_up || return 0
+	gw=$(wan_gw)
+	[ -n "$gw" ] || gw=$(cat "$STATE_DIR/wan_gw" 2>/dev/null)
+	[ -n "$gw" ] || gw=10.254.0.1
+	sip=$(cat "$STATE_DIR/endpoint_host" 2>/dev/null)
+	[ -n "$sip" ] || sip=$(uci -q get "network.${IFNAME}_peer.endpoint_host")
+	[ -n "$sip" ] && pin_host_via_wan "$sip" "$gw"
+	pin_host_via_wan "$(orch_url | sed 's|^https\?://||;s|/.*||')" "$gw"
+	pin_reserved_local "$gw"
+	pin_tunnel_prefix
+	ensure_wg_mark_table "$gw"
+	if split_enabled; then
+		apply_split_routes "$gw"
+		maybe_update_chnroutes
+	else
+		clear_split_routes
+	fi
+	apply_upstream_dns
+}
+
+wait_wan() {
+	local i=0
+	while [ "$i" -lt 45 ]; do
+		if [ -n "$(wan_gw)" ]; then
+			return 0
+		fi
+		sleep 2
+		i=$((i + 1))
+	done
+	return 1
 }
 
 if_up() {
@@ -469,17 +1208,29 @@ handshake_age() {
 }
 
 connect() {
-	local region tun priv addr sip sport spub dns peer_name gw
+	local region tun priv addr sip sport spub dns peer_name gw fail msg
 	region=$(normalize_region "${1:-$(uci_get region)}") || region=""
 
-	if need_login; then
-		login >/dev/null || {
-			json_out '{"ok":false,"msg":"登录失败，无法连接"}'
+	# Always login so login_status / expiry / disable are checked before
+	# applying the unique WireGuard private key.
+	if [ "$NSC_SKIP_LOGIN" != "1" ]; then
+		clear_block
+		clear_login_fail
+		NSC_INNER=1 login >/dev/null || {
+			fail=$(login_fail_reason)
+			case "$fail" in
+				occupied|expired|account)
+					set_want 0
+					;;
+			esac
+			msg=$(cat "$BLOCK_FILE" 2>/dev/null || true)
+			[ -n "$msg" ] || msg="登录失败，无法连接"
+			json_out "$(jq -nc --arg m "$msg" '{ok:false,msg:$m}')"
 			return 1
 		}
 	fi
 
-	tun=$(tunnel_of "$region") || {
+	tun=$(tunnel_of "$region") || tun=$(tunnel_of "") || {
 		json_out "$(jq -nc --arg r "$region" '{ok:false,msg:("没有可用的出口节点" + ( $r|length>0 ? (": "+$r) : "" ))}')"
 		return 1
 	}
@@ -490,7 +1241,7 @@ connect() {
 	sip=$(printf '%s' "$tun" | jq -r '.server_ip // empty')
 	sport=$(printf '%s' "$tun" | jq -r '.server_port // empty')
 	spub=$(printf '%s' "$tun" | jq -r '.server_public_key // empty')
-	dns=$(printf '%s' "$tun" | jq -r '.dns[0] // empty')
+	dns=$(printf '%s' "$tun" | jq -r '.dns[]? // empty')
 	peer_name=$(printf '%s' "$tun" | jq -r '.peer_name // empty')
 
 	if [ -z "$priv" ] || [ -z "$addr" ] || [ -z "$sip" ] || [ -z "$spub" ]; then
@@ -500,63 +1251,275 @@ connect() {
 	[ -n "$sport" ] || sport=51820
 
 	set_region "$region"
+	set_want 1
+	clear_block
+	abort_exit_ip_fetch
+	bump_exit_ip_gen
 	save_wan_default
 	gw=$(cat "$STATE_DIR/wan_gw" 2>/dev/null)
 	[ -n "$gw" ] || gw=$(wan_gw)
+	ensure_wg_mark_table "$gw"
 	pin_host_via_wan "$sip" "$gw"
 	pin_host_via_wan "$(orch_url | sed 's|^https\?://||;s|/.*||')" "$gw"
+	pin_reserved_local "$gw"
 
 	ifdown "$IFNAME" >/dev/null 2>&1 || true
+	flush_wg_conntrack
 	clean_wg_uci
 
+	# auto=0: netifd must not bring WG up at boot before the endpoint
+	# is pinned via WAN. /1 routes would otherwise swallow the handshake.
 	uci -q set "network.${IFNAME}=interface"
 	uci -q set "network.${IFNAME}.proto=wireguard"
 	uci -q set "network.${IFNAME}.private_key=$priv"
 	uci -q add_list "network.${IFNAME}.addresses=${addr}/32"
 	uci -q set "network.${IFNAME}.mtu=1420"
-	[ -n "$dns" ] && uci -q add_list "network.${IFNAME}.dns=$dns"
+	uci -q set "network.${IFNAME}.auto=0"
+	uci -q set "network.${IFNAME}.fwmark=$WG_FWMARK"
+	uci -q set "network.${IFNAME}.tunlink=$(wan_logical)"
 
 	uci -q set "network.${IFNAME}_peer=wireguard_${IFNAME}"
 	uci -q set "network.${IFNAME}_peer.public_key=$spub"
 	uci -q set "network.${IFNAME}_peer.endpoint_host=$sip"
 	uci -q set "network.${IFNAME}_peer.endpoint_port=$sport"
-	uci -q add_list "network.${IFNAME}_peer.allowed_ips=0.0.0.0/0"
+	# /1+/1 covers all IPv4 without replacing the WAN default (0.0.0.0/0).
+	uci -q add_list "network.${IFNAME}_peer.allowed_ips=0.0.0.0/1"
+	uci -q add_list "network.${IFNAME}_peer.allowed_ips=128.0.0.0/1"
 	uci -q set "network.${IFNAME}_peer.route_allowed_ips=1"
 	uci -q set "network.${IFNAME}_peer.persistent_keepalive=25"
+	ensure_endpoint_uci_route "$sip" "$gw"
 	uci commit network
 
 	ensure_wan_zone
 	ifup "$IFNAME"
-	pin_host_via_wan "$sip" "$gw"
-	pin_host_via_wan "$(orch_url | sed 's|^https\?://||;s|/.*||')" "$gw"
 
 	if ! wait_if_up; then
+		unpin_reserved_local
+		clear_wg_mark_table
 		restore_wan_default
+		schedule_retry
 		json_out '{"ok":false,"msg":"WireGuard 接口启动失败"}'
 		return 1
 	fi
+
+	save_tunnel_meta "$sip" "$dns"
+	save_bound_account "$(cached_login_account)"
+	apply_runtime_policy
+	clear_retry
 
 	log "connected region=$region peer=$peer_name endpoint=${sip}:${sport}"
 	json_out "$(jq -nc --arg r "$region" --arg p "$peer_name" --arg ip "$addr" \
 		--arg ep "${sip}:${sport}" \
 		'{ok:true,msg:"已连接",region:$r,peer_name:$p,private_ip:$ip,endpoint:$ep}')"
+	rm -f "$EXIT_IP_FILE"
+	write_status_cache &
+
+	(
+		if ! wait_handshake; then
+			log "no handshake, bounce after re-pin"
+			pin_host_via_wan "$sip" "$gw"
+			ensure_wg_mark_table "$gw"
+			flush_wg_conntrack
+			ifdown "$IFNAME" >/dev/null 2>&1 || true
+			sleep 1
+			ifup "$IFNAME"
+			wait_if_up || true
+			apply_runtime_policy
+			wait_handshake || log "handshake still pending endpoint=${sip}:${sport}"
+		fi
+		fetch_exit_ip
+		write_status_cache
+		apply_runtime_policy
+	) >/dev/null 2>&1 &
 }
 
 disconnect() {
 	ifdown "$IFNAME" >/dev/null 2>&1 || true
 	ip link del dev "$IFNAME" >/dev/null 2>&1 || true
+	flush_wg_conntrack
+	abort_exit_ip_fetch
+	bump_exit_ip_gen
 	clean_wg_uci
 	uci commit network
+	unpin_reserved_local
+	clear_wg_mark_table
+	clear_split_routes
 	restore_wan_default
+	clear_upstream_dns
+	rm -f "$EXIT_IP_FILE" "$STATE_DIR/exit_ip.pid" "$STATE_DIR/endpoint_host" "$STATE_DIR/upstream_dns" \
+		"$STATE_DIR/hs_miss" "$STATE_DIR/retry_at" "$STATE_DIR/retry_n" "$BOUND_ACCOUNT"
+	if [ "$KEEP_WANT" = "1" ]; then
+		:
+	else
+		set_want 0
+		[ "$KEEP_BLOCK" = "1" ] || clear_block
+		[ "$KEEP_BLOCK" = "1" ] || clear_login_fail
+	fi
 	log "disconnected"
 	json_out '{"ok":true,"msg":"已断开"}'
+	write_status_cache &
 }
 
 autostart() {
 	local region
+	if if_up && handshake_age >/dev/null 2>&1 && session_belongs_to "$(uci_get account)"; then
+		apply_runtime_policy
+		return 0
+	fi
+	wait_wan || log "autostart: WAN gateway not ready, continue anyway"
 	region=$(normalize_region "$(uci_get region)") || region=""
-	login >/dev/null || return 1
 	connect "$region"
+}
+
+block_and_drop() {
+	local reason="$1"
+	set_block "$reason"
+	set_want 0
+	if if_up; then
+		KEEP_WANT=1
+		KEEP_BLOCK=1
+		disconnect >/dev/null
+		KEEP_WANT=
+		KEEP_BLOCK=
+	fi
+	write_status_cache
+}
+
+clear_retry() {
+	rm -f "$STATE_DIR/retry_at" "$STATE_DIR/retry_n"
+}
+
+schedule_retry() {
+	local n delay now
+	mkdir_state
+	n=$(cat "$STATE_DIR/retry_n" 2>/dev/null) || n=0
+	n=$((n + 1))
+	delay=$((WATCH_SLEEP * n))
+	[ "$delay" -gt 300 ] && delay=300
+	now=$(date +%s)
+	echo "$n" > "$STATE_DIR/retry_n"
+	echo $((now + delay)) > "$STATE_DIR/retry_at"
+	log "reconnect backoff ${delay}s (try $n)"
+}
+
+retry_ready() {
+	local next now
+	next=$(cat "$STATE_DIR/retry_at" 2>/dev/null) || return 0
+	[ "$next" -gt 0 ] 2>/dev/null || return 0
+	now=$(date +%s)
+	[ "$now" -ge "$next" ]
+}
+
+force_drop_if_blocked() {
+	local fail reason
+	fail=$(login_fail_reason)
+	reason=$(block_reason)
+	case "$fail" in
+		occupied|expired|account)
+			if ! if_up && ! wanted; then
+				return 0
+			fi
+			;;
+		*)
+			return 1
+			;;
+	esac
+	case "$fail" in
+		occupied)
+			block_and_drop "账号已在其他设备登录"
+			;;
+		expired)
+			block_and_drop "账号已到期"
+			;;
+		account)
+			[ -n "$reason" ] || reason="账号已禁用"
+			block_and_drop "$reason"
+			;;
+	esac
+	return 0
+}
+
+refresh_account() {
+	NSC_REFRESH=1 login >/dev/null
+}
+
+watch_tick() {
+	local first="$1" enable age miss region login_age
+
+	enable=$(uci_get enable)
+	[ -n "$enable" ] || enable=0
+
+	if [ "$first" = "1" ]; then
+		[ "$enable" = "1" ] && set_want 1
+		if_up && set_want 1
+	fi
+
+	if account_expired "$(cached_expired_time)"; then
+		block_and_drop "账号已到期"
+		return 0
+	fi
+
+	if force_drop_if_blocked; then
+		return 0
+	fi
+
+	wanted || return 0
+
+	if if_up; then
+		if ! session_belongs_to "$(uci_get account)"; then
+			log "tunnel account mismatch, reconnect with $(uci_get account)"
+			region=$(normalize_region "$(uci_get region)") || region=""
+			connect "$region" >/dev/null || schedule_retry
+			return 0
+		fi
+		login_age=$(last_login_age)
+		if [ "$login_age" -ge "$LOGIN_REFRESH" ]; then
+			refresh_account || {
+				force_drop_if_blocked && return 0
+			}
+			if ! if_up; then
+				wanted || return 0
+				region=$(normalize_region "$(uci_get region)") || region=""
+				connect "$region" >/dev/null || schedule_retry
+				return 0
+			fi
+		fi
+		if age=$(handshake_age); then
+			if [ "$age" -gt "$HANDSHAKE_DEAD" ]; then
+				log "handshake stale age=${age}s, reconnect"
+				rm -f "$STATE_DIR/hs_miss"
+				region=$(normalize_region "$(uci_get region)") || region=""
+				connect "$region" >/dev/null || schedule_retry
+			else
+				rm -f "$STATE_DIR/hs_miss"
+			fi
+		else
+			miss=$(cat "$STATE_DIR/hs_miss" 2>/dev/null) || miss=0
+			miss=$((miss + 1))
+			echo "$miss" > "$STATE_DIR/hs_miss"
+			if [ "$miss" -ge $((HANDSHAKE_DEAD / WATCH_SLEEP)) ]; then
+				log "no handshake after ${HANDSHAKE_DEAD}s, reconnect"
+				rm -f "$STATE_DIR/hs_miss"
+				region=$(normalize_region "$(uci_get region)") || region=""
+				connect "$region" >/dev/null || schedule_retry
+			fi
+		fi
+		return 0
+	fi
+
+	retry_ready || return 0
+	region=$(normalize_region "$(uci_get region)") || region=""
+	connect "$region" >/dev/null || schedule_retry
+}
+
+watch_loop() {
+	mkdir_state
+	trap 'exit 0' INT TERM
+	log "watch started"
+	run_locked watch_tick 1 || true
+	while sleep "$WATCH_SLEEP"; do
+		run_locked watch_tick 0 || true
+	done
 }
 
 fmt_expired() {
@@ -566,10 +1529,157 @@ fmt_expired() {
 	date -d "@$ts" '+%Y-%m-%d %H:%M:%S' 2>/dev/null || date -D '%s' -d "$ts" '+%Y-%m-%d %H:%M:%S' 2>/dev/null || echo "$ts"
 }
 
+is_public_ipv4() {
+	local ip a b
+	ip=$(trim "$1")
+	echo "$ip" | grep -qE '^[0-9]{1,3}(\.[0-9]{1,3}){3}$' || return 1
+	a=$(echo "$ip" | cut -d. -f1)
+	b=$(echo "$ip" | cut -d. -f2)
+	case "$a" in
+		0|10|127) return 1 ;;
+		169) [ "$b" = "254" ] && return 1 ;;
+		172) [ "$b" -ge 16 ] && [ "$b" -le 31 ] && return 1 ;;
+		192) [ "$b" = "168" ] && return 1 ;;
+		224|225|226|227|228|229|230|231|232|233|234|235|236|237|238|239|240|255) return 1 ;;
+	esac
+	return 0
+}
+
+iface_private_ip() {
+	ip -4 -o addr show dev "$IFNAME" 2>/dev/null | awk '{print $4}' | head -n1 | cut -d/ -f1
+}
+
+region_of_addr() {
+	local ip
+	ip=$(trim "$1")
+	[ -n "$ip" ] && [ -s "$LOGIN_JSON" ] || return 0
+	jq -r --arg ip "$ip" \
+		'.data.wg_tunnels[]? | select(.private_ip==$ip) | .region // empty' \
+		"$LOGIN_JSON" | head -n1
+}
+
+exit_ip_gen() {
+	cat "$STATE_DIR/exit_ip.gen" 2>/dev/null || echo 0
+}
+
+bump_exit_ip_gen() {
+	local n
+	mkdir_state
+	n=$(exit_ip_gen)
+	echo $((n + 1)) > "$STATE_DIR/exit_ip.gen"
+	rm -f "$EXIT_IP_FILE"
+}
+
+abort_exit_ip_fetch() {
+	local pid
+	pid=$(cat "$STATE_DIR/exit_ip.pid" 2>/dev/null)
+	if [ -n "$pid" ]; then
+		kill "$pid" 2>/dev/null || true
+		kill -9 "$pid" 2>/dev/null || true
+	fi
+	rm -f "$STATE_DIR/exit_ip.pid"
+}
+
+read_exit_cache() {
+	local ip region ts ifaddr gen cur
+	[ -s "$EXIT_IP_FILE" ] || return 1
+	read -r ip region ts ifaddr gen < "$EXIT_IP_FILE" || return 1
+	cur=$(iface_private_ip)
+	[ -n "$cur" ] && [ "$ifaddr" = "$cur" ] || return 1
+	[ "$(exit_ip_gen)" = "$gen" ] || return 1
+	is_public_ipv4 "$ip" || return 1
+	printf '%s %s\n' "$ip" "$region"
+}
+
+read_exit_ip() {
+	read_exit_cache | awk '{print $1; exit}'
+}
+
+exit_ip_need_fetch() {
+	local ip region ts ifaddr gen now cur
+	if_up || return 1
+	handshake_age >/dev/null 2>&1 || return 1
+	cur=$(iface_private_ip)
+	[ -n "$cur" ] || return 1
+	now=$(date +%s)
+	if [ ! -s "$EXIT_IP_FILE" ]; then
+		return 0
+	fi
+	read -r ip region ts ifaddr gen < "$EXIT_IP_FILE" || return 0
+	[ "$ifaddr" = "$cur" ] && [ "$(exit_ip_gen)" = "$gen" ] || return 0
+	[ -n "$ts" ] || return 0
+	if is_public_ipv4 "$ip"; then
+		[ $((now - ts)) -ge 600 ] && return 0
+		return 1
+	fi
+	[ $((now - ts)) -ge 15 ] && return 0
+	return 1
+}
+
+fetch_exit_ip() {
+	local url ip gen addr live
+	if_up || return 1
+	handshake_age >/dev/null 2>&1 || return 1
+	mkdir_state
+	gen=$(exit_ip_gen)
+	addr=$(iface_private_ip)
+	live=$(region_of_addr "$addr")
+	[ -n "$addr" ] || return 1
+	[ -n "$live" ] || live=$(uci_get region)
+	for url in \
+		https://ipinfo.in/ \
+		http://ipinfo.io/ip \
+		http://ifconfig.me \
+		http://icanhazip.com
+	do
+		ip=$(curl -sS -L --http1.1 -m 6 --connect-timeout 4 \
+			--interface "$IFNAME" "$url" 2>/dev/null \
+			| tr -d '\r' | sed -n '1s/[[:space:]]*$//p')
+		is_public_ipv4 "$ip" || continue
+		[ "$(exit_ip_gen)" = "$gen" ] || return 1
+		[ "$(iface_private_ip)" = "$addr" ] || return 1
+		printf '%s %s %s %s %s\n' "$ip" "$live" "$(date +%s)" "$addr" "$gen" > "$EXIT_IP_FILE"
+		log "exit ip $ip region=$live"
+		return 0
+	done
+	[ "$(exit_ip_gen)" = "$gen" ] || return 1
+	[ "$(iface_private_ip)" = "$addr" ] || return 1
+	printf '%s %s %s %s %s\n' "-" "$live" "$(date +%s)" "$addr" "$gen" > "$EXIT_IP_FILE"
+	return 1
+}
+
+exit_ip_busy() {
+	local pid
+	pid=$(cat "$STATE_DIR/exit_ip.pid" 2>/dev/null)
+	[ -n "$pid" ] && kill -0 "$pid" 2>/dev/null
+}
+
+maybe_refresh_exit_ip() {
+	local live want
+	if_up || { rm -f "$EXIT_IP_FILE"; return 0; }
+	handshake_age >/dev/null 2>&1 || return 0
+	live=$(region_of_addr "$(iface_private_ip)")
+	want=$(uci_get region)
+	# Still on the previous tunnel while UCI already points at the new region.
+	[ -n "$live" ] && [ -n "$want" ] && [ "$live" = "$want" ] || return 0
+	exit_ip_need_fetch || return 0
+	exit_ip_busy && return 0
+	mkdir_state
+	(
+		echo $$ > "$STATE_DIR/exit_ip.pid"
+		fetch_exit_ip
+		rm -f "$STATE_DIR/exit_ip.pid"
+		write_status_cache
+	) >/dev/null 2>&1 &
+}
+
 status_json() {
 	local orch domain account region enable connected handshake age rx tx
 	local expired expired_text login_account groupname login_status
-	local nodes endpoint private_ip peer_name
+	local nodes endpoint private_ip peer_name exit_ip exit_ip_region live_region
+	local _eip _ereg _ets _eaddr _egen
+	local split dns_mode dns_china dns_overseas chn_count
+	local want blocked login_pending login_result
 
 	orch=$(orch_url)
 	domain=$(agent_domain) || domain=""
@@ -577,6 +1687,35 @@ status_json() {
 	region=$(uci_get region)
 	enable=$(uci_get enable)
 	[ -n "$enable" ] || enable=0
+	want=$(uci_get want)
+	case "$want" in
+		1) ;;
+		*) want=0 ;;
+	esac
+	blocked=$(cat "$BLOCK_FILE" 2>/dev/null || true)
+	login_pending=false
+	login_result='{}'
+	[ -f "$LOGIN_JOB" ] && login_pending=true
+	if [ -s "$LOGIN_RESULT" ] && jq -e . "$LOGIN_RESULT" >/dev/null 2>&1; then
+		login_result=$(cat "$LOGIN_RESULT")
+	fi
+	split=1
+	case "$(uci_get split)" in
+		0|off|false|no) split=0 ;;
+	esac
+	dns_mode=global
+	dns_china=""
+	dns_overseas=""
+	chn_count=0
+	if [ "$split" = "1" ]; then
+		dns_mode=split
+		dns_china=$(china_dns)
+		dns_overseas=$(overseas_dns)
+		chnroutes_valid "$CHN_FILE" && chn_count=$(chnroutes_count "$CHN_FILE")
+		[ "$chn_count" -gt 0 ] 2>/dev/null || {
+			chnroutes_valid "$CHN_FALLBACK" && chn_count=$(chnroutes_count "$CHN_FALLBACK")
+		}
+	fi
 
 	connected=false
 	handshake=false
@@ -589,13 +1728,32 @@ status_json() {
 
 	if if_up; then
 		connected=true
-		age=$(handshake_age) && [ "$age" -ge 0 ] && [ "$age" -lt 180 ] && handshake=true
+		age=$(handshake_age) && handshake=true || age=0
 		rx=$(wg show "$IFNAME" transfer 2>/dev/null | awk 'NF>=3 {print $2; exit}')
 		tx=$(wg show "$IFNAME" transfer 2>/dev/null | awk 'NF>=3 {print $3; exit}')
 		[ -n "$rx" ] || rx=0
 		[ -n "$tx" ] || tx=0
 		endpoint=$(wg show "$IFNAME" endpoints 2>/dev/null | awk 'NF>=2 {print $2; exit}')
-		private_ip=$(ip -4 -o addr show dev "$IFNAME" 2>/dev/null | awk '{print $4}' | head -n1 | cut -d/ -f1)
+		private_ip=$(iface_private_ip)
+	else
+		abort_exit_ip_fetch
+		rm -f "$EXIT_IP_FILE" 2>/dev/null || true
+		private_ip=""
+	fi
+	live_region=$(region_of_addr "$private_ip")
+	exit_ip=""
+	exit_ip_region=""
+	if if_up; then
+		maybe_refresh_exit_ip
+		if [ -s "$EXIT_IP_FILE" ]; then
+			read -r _eip _ereg _ets _eaddr _egen < "$EXIT_IP_FILE" || true
+			if is_public_ipv4 "$_eip" && [ "$_eaddr" = "$private_ip" ] && \
+				[ "$(exit_ip_gen)" = "$_egen" ] && \
+				[ -n "$live_region" ] && [ "$_ereg" = "$live_region" ]; then
+				exit_ip=$_eip
+				exit_ip_region=$_ereg
+			fi
+		fi
 	fi
 
 	nodes='[]'
@@ -616,12 +1774,22 @@ status_json() {
 		fi
 	fi
 
+	mkdir_state
 	jq -nc \
 		--arg orch "$orch" \
 		--arg domain "$domain" \
 		--arg account "$account" \
 		--arg region "$region" \
 		--argjson enable "$enable" \
+		--argjson want "$want" \
+		--argjson login_pending "$login_pending" \
+		--argjson login_result "$login_result" \
+		--arg block_reason "${blocked:-}" \
+		--argjson split "$split" \
+		--arg dns_mode "$dns_mode" \
+		--arg dns_china "$dns_china" \
+		--arg dns_overseas "$dns_overseas" \
+		--argjson chnroutes_count "${chn_count:-0}" \
 		--argjson connected "$connected" \
 		--argjson handshake "$handshake" \
 		--argjson handshake_age "$age" \
@@ -635,6 +1803,10 @@ status_json() {
 		--arg login_account "$login_account" \
 		--arg groupname "$groupname" \
 		--arg login_status "$login_status" \
+		--arg exit_ip "${exit_ip:-}" \
+		--arg exit_ip_region "${exit_ip_region:-}" \
+		--arg live_region "${live_region:-}" \
+		--argjson ts "$(date +%s)" \
 		--argjson nodes "$nodes" \
 		'{
 			ok:true,
@@ -642,7 +1814,17 @@ status_json() {
 			domain:$domain,
 			account:$account,
 			region:$region,
+			live_region:$live_region,
 			enable:$enable,
+			want:$want,
+			login_pending:$login_pending,
+			login_result:$login_result,
+			block_reason:$block_reason,
+			split:$split,
+			dns_mode:$dns_mode,
+			dns_china:$dns_china,
+			dns_overseas:$dns_overseas,
+			chnroutes_count:$chnroutes_count,
 			connected:$connected,
 			handshake:$handshake,
 			handshake_age:$handshake_age,
@@ -656,8 +1838,17 @@ status_json() {
 			login_account:$login_account,
 			groupname:$groupname,
 			login_status:$login_status,
+			exit_ip:$exit_ip,
+			exit_ip_region:$exit_ip_region,
+			ts:$ts,
 			nodes:$nodes
-		}'
+		}' | tee "$STATUS_JSON.tmp"
+	mv -f "$STATUS_JSON.tmp" "$STATUS_JSON" 2>/dev/null || true
+	chmod 600 "$STATUS_JSON" 2>/dev/null || true
+}
+
+write_status_cache() {
+	status_json >/dev/null 2>&1 || true
 }
 
 usage() {
@@ -668,13 +1859,16 @@ Usage: nsclient <command> [args]
   disconnect
   status
   autostart
+  watch
+  routes
   sync
-  get orch|domain|account|region|enable
+  get orch|domain|account|region|enable|split
   set orch <url>
   set domain <host>
   set account <user> [password]
   set region <region>
   set enable <0|1>
+  set split <0|1>
 EOF
 }
 
@@ -682,11 +1876,13 @@ cmd=$1
 shift 2>/dev/null || true
 
 case "$cmd" in
-	login) login "$@" ;;
-	connect) connect "$@" ;;
-	disconnect) disconnect ;;
+	login) run_locked login "$@" ;;
+	connect) run_locked connect "$@" ;;
+	disconnect) run_locked disconnect ;;
 	status) status_json ;;
-	autostart) autostart ;;
+	autostart) run_locked autostart ;;
+	watch) watch_loop ;;
+	routes) apply_runtime_policy ;;
 	sync) sync_from_env ;;
 	get)
 		case "$1" in
@@ -695,6 +1891,7 @@ case "$cmd" in
 			account) uci_get account; echo ;;
 			region) uci_get region; echo ;;
 			enable) uci_get enable; echo ;;
+			split) split_enabled && echo 1 || echo 0 ;;
 			*) usage; exit 1 ;;
 		esac
 		;;
@@ -705,6 +1902,7 @@ case "$cmd" in
 			account) set_account "$2" "$3" ;;
 			region) set_region "$2" ;;
 			enable) set_enable "$2" ;;
+			split) set_split "$2" ;;
 			*) usage; exit 1 ;;
 		esac
 		;;

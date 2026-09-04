@@ -7,7 +7,7 @@
 		}
 	},
 	"admin/nsclient/config": {
-		"title": "常规配置",
+		"title": "连接",
 		"order": 1,
 		"action": {
 			"type": "call",
