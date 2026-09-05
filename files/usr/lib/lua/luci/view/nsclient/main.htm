@@ -69,24 +69,48 @@
 	}
 	#nsclient-app .nsc-badge-wait { background: var(--nros-warning, #f89406); }
 	#nsclient-app input[disabled] { opacity: .55; cursor: not-allowed; }
-	#nsclient-app input.nros-btn { width: auto; }
+	#nsclient-app input.nros-btn { width: auto; appearance: none; -webkit-appearance: none; border: 1px solid transparent; }
+	#nsclient-app input.nros-btn.nros-btn--primary {
+		background: var(--nros-primary, #0F6E6B);
+		color: var(--nros-primary-fg, #fff);
+		border-color: transparent;
+	}
+	#nsclient-app .nsc-step-label { margin-top: 2px; font-size: 12px; font-weight: 500; color: var(--nros-text-3, #6B7280); }
+	#nsclient-app .nsc-actions--hd { margin: 0; }
+	#nsclient-app .nsc-tour-target { position: relative; z-index: 5; box-shadow: 0 0 0 3px var(--nros-primary, #0F6E6B); }
+	#nsc-tour[hidden] { display: none !important; }
+	#nsc-tour { position: fixed; inset: 0; z-index: 80; pointer-events: none; }
+	#nsc-tour-pop {
+		position: fixed; z-index: 83; width: min(360px, calc(100vw - 32px));
+		padding: 16px 16px 14px; border-radius: 10px;
+		background: var(--nros-elevated, #fff); border: 1px solid var(--nros-border, #e5e7eb);
+		box-shadow: 0 12px 32px rgba(17,24,39,.12); pointer-events: auto;
+	}
+	#nsc-tour-pop .nsc-tour-kicker { font-size: 11px; font-weight: 600; color: var(--nros-primary, #0F6E6B); margin-bottom: 4px; }
+	#nsc-tour-pop .nsc-tour-title { font-size: 15px; font-weight: 600; margin: 0 0 6px; }
+	#nsc-tour-pop .nsc-tour-body { margin: 0 0 14px; font-size: 13px; color: var(--nros-text-2, #4B5563); line-height: 1.55; }
+	#nsc-tour-pop .nsc-tour-nav { display: flex; justify-content: flex-end; gap: 8px; }
 </style>
 
 <div id="nsclient-app">
 	<div class="nros-page-head">
 		<div>
 			<h1 class="nros-title" name="content">VPN</h1>
-			<p class="nros-subtitle">登录账号，选择出口后连接。分流：国内走本地网络，海外走隧道。全局：全部公网走隧道。</p>
+			<p class="nros-subtitle">先登录账号，再选择出口连接。分流：国内走本地网络，海外走隧道。全局：全部公网走隧道。</p>
 		</div>
+		<input type="button" class="nros-btn" id="nsc-guide-start" value="使用引导" />
 	</div>
 
 	<div id="nsc-status" class="nsc-status nsc-off">正在读取状态…</div>
 	<div id="nsc-msg" class="nsc-msg"></div>
 
 	<div class="nros-grid nros-grid--2">
-		<section class="nros-card">
+		<section class="nros-card" id="nsc-card-account">
 			<div class="nros-card__hd">
-				<div class="nros-section-title">账号</div>
+				<div>
+					<div class="nros-section-title">账号</div>
+					<div class="nsc-step-label">第 1 步 · 登录账号</div>
+				</div>
 			</div>
 			<div class="nros-card__bd">
 				<div class="nros-field">
@@ -98,6 +122,9 @@
 					<input class="nros-input" type="password" id="nsc-password" autocomplete="current-password" />
 					<span class="nsc-hint">已保存过则可留空</span>
 				</div>
+				<div class="nsc-actions">
+					<input type="button" class="nros-btn nros-btn--primary" id="nsc-login" value="登录" />
+				</div>
 				<div class="nsc-toggle">
 					<label class="nros-switch">
 						<input type="checkbox" id="nsc-enable" />
@@ -105,7 +132,7 @@
 					</label>
 					<div>
 						<div class="nsc-toggle__label">开机连接</div>
-						<div class="nsc-hint">使用上次选择的出口，开机后自动连接</div>
+						<div class="nsc-hint">未选出口时：只有一个就用它，多个则默认第一个</div>
 					</div>
 				</div>
 				<div class="nsc-toggle">
@@ -118,15 +145,15 @@
 						<div class="nsc-hint">国内网站直连，海外走隧道（chnroutes）</div>
 					</div>
 				</div>
-				<div class="nsc-actions">
-					<input type="button" class="nros-btn nros-btn--primary" id="nsc-login" value="登录" />
-				</div>
 			</div>
 		</section>
 
-		<section class="nros-card">
+		<section class="nros-card" id="nsc-card-exits">
 			<div class="nros-card__hd">
-				<div class="nros-section-title">可用出口</div>
+				<div>
+					<div class="nros-section-title">可用出口</div>
+					<div class="nsc-step-label">第 2 步 · 选择出口并连接</div>
+				</div>
 			</div>
 			<div class="nros-card__bd">
 				<div id="nsc-empty" class="nsc-meta">正在获取可用出口…</div>
@@ -137,6 +164,18 @@
 				</div>
 			</div>
 		</section>
+	</div>
+</div>
+
+<div id="nsc-tour" hidden>
+	<div id="nsc-tour-pop" role="dialog" aria-modal="true" aria-labelledby="nsc-tour-title">
+		<div class="nsc-tour-kicker" id="nsc-tour-kicker"></div>
+		<div class="nsc-tour-title" id="nsc-tour-title"></div>
+		<p class="nsc-tour-body" id="nsc-tour-body"></p>
+		<div class="nsc-tour-nav">
+			<input type="button" class="nros-btn" id="nsc-tour-skip" value="跳过" />
+			<input type="button" class="nros-btn nros-btn--primary" id="nsc-tour-next" value="下一步" />
+		</div>
 	</div>
 </div>
 
@@ -163,6 +202,23 @@
 	var accountFilled = false;
 	var accountSyncing = false;
 	var accountSynced = false;
+	var GUIDE_KEY = 'nros-vpn-guide';
+	var GUIDE_STEPS = [
+		{
+			target: 'nsc-card-account',
+			kicker: '两步连接  1 / 2',
+			title: '先登录账号',
+			body: '填写账号和密码，点「登录」。登录成功后，右侧才会出现可用出口。已保存过密码则可留空。'
+		},
+		{
+			target: 'nsc-card-exits',
+			kicker: '两步连接  2 / 2',
+			title: '再选择出口并连接',
+			body: '在列表中点选一个出口，再点下方「连接」。也可以直接打开「开机连接」：只有一个出口就用它，多个则默认第一个。'
+		}
+	];
+	var guideStep = -1;
+	var guideOn = false;
 
 	function $(id) { return document.getElementById(id); }
 
@@ -200,6 +256,33 @@
 		return '';
 	}
 
+	function selectRegion(code) {
+		if (!code) return '';
+		var radios = document.getElementsByName('nsc-region');
+		for (var i = 0; i < radios.length; i++) {
+			if (radios[i].value === code) {
+				radios[i].checked = true;
+				return code;
+			}
+		}
+		return '';
+	}
+
+	function pickDefaultRegion() {
+		var sel = selectedRegion();
+		if (sel) return sel;
+		var st = lastStatus || {};
+		var nodes = st.nodes || lastNodes || [];
+		var want = st.live_region || st.region || '';
+		if (want && selectRegion(want))
+			return want;
+		if (nodes.length && nodes[0].region) {
+			selectRegion(nodes[0].region);
+			return nodes[0].region;
+		}
+		return selectedRegion();
+	}
+
 	function needsAccountInfo(st) {
 		st = st || lastStatus || {};
 		var nodes = st.nodes || [];
@@ -208,7 +291,7 @@
 
 	function updateButtons() {
 		var st = lastStatus || {};
-		var region = selectedRegion();
+		var region = pickDefaultRegion();
 		var connBtn = $('nsc-connect');
 		var discBtn = $('nsc-disconnect');
 		if (busy) return;
@@ -379,7 +462,7 @@
 			password: scrub($('nsc-password').value),
 			enable: $('nsc-enable').checked ? '1' : '0',
 			split: ($('nsc-split') && $('nsc-split').checked) ? '1' : '0',
-			region: scrubRegion(selectedRegion())
+			region: scrubRegion(pickDefaultRegion())
 		};
 	}
 
@@ -521,6 +604,8 @@
 						setMsg(msg || '登录成功');
 						if (st && st.nodes && st.nodes.length)
 							renderNodes(st.nodes, selectedRegion() || st.live_region || st.nodes[0].region, st);
+						if (guideOn && guideStep === 0)
+							showGuideStep(1);
 					} else {
 						setMsg(msg || '登录失败', true);
 					}
@@ -564,8 +649,8 @@
 
 	$('nsc-connect').onclick = function() {
 		var btn = this;
-		var region = selectedRegion();
-		if (!region) { setMsg('请先选择一个出口', true); return; }
+		var region = pickDefaultRegion();
+		if (!region) { setMsg('暂无可用出口，请先登录', true); return; }
 		var from = (lastStatus && (lastStatus.live_region || lastStatus.region)) || '';
 		var fromIp = (lastStatus && lastStatus.private_ip) || '';
 		var switching = !!(from && from !== region);
@@ -586,10 +671,12 @@
 					done();
 				}
 			});
-			waitUntilRegion(region, fromIp, op, 0, function() {
+			waitUntilRegion(region, fromIp, op, 0, function(ok) {
 				switchingTo = null;
 				refreshStatus();
 				done();
+				if (ok && guideOn)
+					endGuide(true);
 			});
 		});
 	};
@@ -608,9 +695,22 @@
 	};
 
 	$('nsc-enable').onchange = function() {
-		post(U_SAVE, { enable: this.checked ? '1' : '0' }, function(j) {
-			if (j && j.ok) setMsg(this.checked ? '已开启开机连接' : '已关闭开机连接');
-		}.bind(this));
+		var on = this.checked;
+		var fields = { enable: on ? '1' : '0' };
+		var region = '';
+		if (on) {
+			region = pickDefaultRegion();
+			if (region) fields.region = region;
+		}
+		post(U_SAVE, fields, function(j) {
+			if (j && j.ok) {
+				var extra = (on && region) ? ('，出口 ' + regionLabel(region)) : '';
+				setMsg(on ? ('已开启开机连接' + extra) : '已关闭开机连接');
+				updateButtons();
+			} else {
+				setMsg((j && j.msg) || '保存失败', true);
+			}
+		});
 	};
 
 	$('nsc-split').onchange = function() {
@@ -634,6 +734,89 @@
 		}
 	};
 
+	function guideDone() {
+		try { return localStorage.getItem(GUIDE_KEY) === 'done'; } catch (e) { return false; }
+	}
+
+	function markGuideDone() {
+		try { localStorage.setItem(GUIDE_KEY, 'done'); } catch (e) {}
+	}
+
+	function clearGuideTarget() {
+		var cards = document.querySelectorAll('#nsclient-app .nsc-tour-target');
+		for (var i = 0; i < cards.length; i++)
+			cards[i].classList.remove('nsc-tour-target');
+	}
+
+	function placeTourPop(target) {
+		var pop = $('nsc-tour-pop');
+		if (!pop || !target) return;
+		var r = target.getBoundingClientRect();
+		var gap = 12;
+		var left = Math.min(Math.max(16, r.left), window.innerWidth - pop.offsetWidth - 16);
+		var top = r.bottom + gap;
+		if (top + pop.offsetHeight > window.innerHeight - 12)
+			top = Math.max(12, r.top - pop.offsetHeight - gap);
+		pop.style.left = left + 'px';
+		pop.style.top = top + 'px';
+	}
+
+	function showGuideStep(n) {
+		var step = GUIDE_STEPS[n];
+		var root = $('nsc-tour');
+		if (!step || !root) return;
+		guideOn = true;
+		guideStep = n;
+		clearGuideTarget();
+		var target = $(step.target);
+		if (target) {
+			target.classList.add('nsc-tour-target');
+			try { target.scrollIntoView({ behavior: 'smooth', block: 'center' }); } catch (e) {}
+		}
+		$('nsc-tour-kicker').textContent = step.kicker;
+		$('nsc-tour-title').textContent = step.title;
+		$('nsc-tour-body').textContent = step.body;
+		$('nsc-tour-next').value = (n >= GUIDE_STEPS.length - 1) ? '完成' : '下一步';
+		root.hidden = false;
+		placeTourPop(target);
+		setTimeout(function() { placeTourPop(target); }, 320);
+	}
+
+	function endGuide(save) {
+		guideOn = false;
+		guideStep = -1;
+		clearGuideTarget();
+		var root = $('nsc-tour');
+		if (root) root.hidden = true;
+		if (save) markGuideDone();
+	}
+
+	function startGuide() {
+		showGuideStep(0);
+	}
+
+	$('nsc-guide-start').onclick = function() { startGuide(); };
+	$('nsc-tour-skip').onclick = function() { endGuide(true); };
+	$('nsc-tour-next').onclick = function() {
+		if (guideStep >= GUIDE_STEPS.length - 1)
+			endGuide(true);
+		else
+			showGuideStep(guideStep + 1);
+	};
+	document.addEventListener('keydown', function(ev) {
+		if (!guideOn) return;
+		if ((ev.key || ev.keyCode) === 'Escape' || ev.keyCode === 27)
+			endGuide(true);
+	});
+	window.addEventListener('resize', function() {
+		if (guideOn && GUIDE_STEPS[guideStep])
+			placeTourPop($(GUIDE_STEPS[guideStep].target));
+	});
+	window.addEventListener('scroll', function() {
+		if (guideOn && GUIDE_STEPS[guideStep])
+			placeTourPop($(GUIDE_STEPS[guideStep].target));
+	}, true);
+
 	XHR.poll(5, U_STATUS, null, function(x, st) {
 		if (!busy) {
 			renderStatus(st);
@@ -643,6 +826,8 @@
 	if (CACHED && CACHED.ok) renderStatus(CACHED);
 	refreshStatus(function(st) {
 		if (needsAccountInfo(st)) syncAccountInfo();
+		if (!guideDone() && !(st && st.connected && st.handshake))
+			setTimeout(startGuide, 500);
 	});
 })();
 //]]></script>
