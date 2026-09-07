@@ -87,6 +87,10 @@ local function valid_split(v)
 	return nil
 end
 
+local function valid_killswitch(v)
+	return valid_split(v)
+end
+
 local function run_json(cmd)
 	local raw = util.trim(sys.exec(cmd .. " 2>/dev/null") or "")
 	local e = jsonc.parse(raw)
@@ -152,6 +156,7 @@ function action_save()
 	local enable = scrub(http.formvalue("enable") or "")
 	local region = valid_region(http.formvalue("region"))
 	local split = valid_split(http.formvalue("split") or "")
+	local killswitch = valid_killswitch(http.formvalue("killswitch") or "")
 
 	if account then
 		if password then
@@ -165,6 +170,9 @@ function action_save()
 	end
 	if split then
 		sys.call("/usr/sbin/nsclient set split " .. sh_quote(split) .. " >/dev/null")
+	end
+	if killswitch then
+		sys.call("/usr/sbin/nsclient set killswitch " .. sh_quote(killswitch) .. " >/dev/null")
 	end
 	if region then
 		sys.call("/usr/sbin/nsclient set region " .. sh_quote(region) .. " >/dev/null")
@@ -193,7 +201,7 @@ function action_login()
 	-- Login may disconnect the old tunnel (account switch) then wait on
 	-- HTTPS; that exceeds uhttpd idle timeout. Return immediately and
 	-- let the page poll status.login_pending / login_result.
-	os.execute("mkdir -p /var/run/nsclient; echo pending > /var/run/nsclient/login.job; rm -f /var/run/nsclient/login.result; /usr/sbin/nsclient login >/dev/null 2>&1 &")
+	os.execute("mkdir -p /var/run/nsclient; date +%s > /var/run/nsclient/login.job; rm -f /var/run/nsclient/login.result; /usr/sbin/nsclient login >/dev/null 2>&1 &")
 	http.prepare_content("application/json")
 	http.write_json({
 		ok = true,

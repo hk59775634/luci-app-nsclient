@@ -13,5 +13,18 @@ start_service() {
 }
 
 stop_service() {
-	KEEP_WANT=1 /usr/sbin/nsclient disconnect >/dev/null 2>&1 || true
+	if [ "$NSC_KEEP_WANT" = "1" ]; then
+		KEEP_WANT=1 /usr/sbin/nsclient disconnect >/dev/null 2>&1 || true
+	else
+		/usr/sbin/nsclient disconnect >/dev/null 2>&1 || true
+	fi
+	/usr/sbin/nsclient killswitch >/dev/null 2>&1 || true
+}
+
+restart() {
+	NSC_KEEP_WANT=1
+	export NSC_KEEP_WANT
+	stop "$@"
+	unset NSC_KEEP_WANT
+	start "$@"
 }

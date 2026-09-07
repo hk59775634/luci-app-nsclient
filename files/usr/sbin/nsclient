@@ -267,6 +267,63 @@ set_split() {
 	if_up && (apply_runtime_policy) >/dev/null 2>&1 &
 }
 
+killswitch_enabled() {
+	case "$(uci_get killswitch)" in
+		1|on|true|yes) return 0 ;;
+		*) return 1 ;;
+	esac
+}
+
+set_killswitch() {
+	ensure_uci
+	case "$1" in
+		1|on|true|yes) uci_set killswitch 1 ;;
+		*) uci_set killswitch 0 ;;
+	esac
+	uci commit "$UCI_PKG"
+	apply_killswitch
+	write_status_cache &
+}
+
+lan_dev() {
+	local d
+	d=$(uci -q get network.lan.device)
+	[ -n "$d" ] || d=$(uci -q get network.lan.ifname)
+	d=$(printf '%s' "$d" | awk '{print $1}')
+	[ -n "$d" ] && [ -d "/sys/class/net/$d" ] && { printf '%s' "$d"; return 0; }
+	printf '%s' br-lan
+}
+
+ks_clear() {
+	local prev lan i
+	command -v iptables >/dev/null 2>&1 || return 0
+	prev=$(cat "$STATE_DIR/ks_lan" 2>/dev/null)
+	lan=$(lan_dev)
+	for i in $prev $lan br-lan; do
+		[ -n "$i" ] || continue
+		iptables -D FORWARD -i "$i" -j nsc_ks 2>/dev/null || true
+	done
+	iptables -F nsc_ks 2>/dev/null || true
+	iptables -X nsc_ks 2>/dev/null || true
+	rm -f "$STATE_DIR/ks_lan"
+}
+
+apply_killswitch() {
+	local lan
+	command -v iptables >/dev/null 2>&1 || return 0
+	ks_clear
+	killswitch_enabled || return 0
+	wanted || return 0
+	lan=$(lan_dev)
+	[ -n "$lan" ] || return 0
+	iptables -N nsc_ks 2>/dev/null || iptables -F nsc_ks
+	iptables -A nsc_ks -o "$IFNAME" -j RETURN
+	iptables -A nsc_ks -j REJECT --reject-with icmp-net-prohibited
+	iptables -I FORWARD 1 -i "$lan" -j nsc_ks
+	mkdir_state
+	printf '%s' "$lan" > "$STATE_DIR/ks_lan"
+}
+
 mkdir_state() {
 	mkdir -p "$STATE_DIR"
 	chmod 700 "$STATE_DIR"
@@ -506,7 +563,7 @@ login() {
 		set_login_fail expired
 		set_block "账号已到期"
 		rm -f "$LOGIN_JSON"
-		login_finish '{"ok":false,code:200,msg:"账号已到期"}' 1
+		login_finish '{"ok":false,"code":200,"msg":"账号已到期"}' 1
 		write_status_cache &
 		return 1
 	fi
@@ -516,7 +573,7 @@ login() {
 		set_login_fail account
 		set_block "账号已禁用或没有可用节点"
 		rm -f "$LOGIN_JSON"
-		login_finish '{"ok":false,code:200,msg:"账号已禁用或没有可用节点"}' 1
+		login_finish '{"ok":false,"code":200,"msg":"账号已禁用或没有可用节点"}' 1
 		write_status_cache &
 		return 1
 	fi
@@ -730,26 +787,24 @@ curl_one() {
 	ip=$(resolve_ipv4 "$host") || true
 	[ -n "$ip" ] && extra="--resolve ${host}:${port}:${ip}"
 	# shellcheck disable=SC2086
-	curl -sS --http1.1 -m "${3:-15}" -X POST $extra "$url" \
+	curl -sS -k --http1.1 -m "${3:-15}" -X POST $extra "$url" \
 		-H 'Content-Type: application/json' \
 		-H 'Accept: application/json' \
 		--data-binary "$body"
 }
 
 curl_post_json() {
-	local url body alt
+	local url body
 	url=$1
 	body=$2
 	ensure_clock
 	ensure_dns
 	case "$url" in
 		https://*)
-			if curl_one "$url" "$body" 6; then
+			if curl_one "$url" "$body" 8; then
 				return 0
 			fi
-			alt="http://${url#https://}"
-			log "https failed, retry $alt"
-			curl_one "$alt" "$body" 15
+			curl_one "$url" "$body" 20
 			return $?
 			;;
 	esac
@@ -1138,6 +1193,7 @@ clear_upstream_dns() {
 
 apply_runtime_policy() {
 	local gw sip
+	apply_killswitch
 	if_up || return 0
 	gw=$(wan_gw)
 	[ -n "$gw" ] || gw=$(cat "$STATE_DIR/wan_gw" 2>/dev/null)
@@ -1185,18 +1241,22 @@ wait_if_up() {
 }
 
 save_wan_default() {
-	local gw
+	local gw dev
 	mkdir_state
 	gw=$(wan_gw)
+	dev=$(ip -4 route show default 2>/dev/null | awk '/via/ && $0 !~ /nsclient/ {for (i = 1; i <= NF; i++) if ($i == "dev") { print $(i + 1); exit }}')
 	[ -n "$gw" ] && printf '%s' "$gw" > "$STATE_DIR/wan_gw"
+	[ -n "$dev" ] && printf '%s' "$dev" > "$STATE_DIR/wan_dev"
 }
 
 restore_wan_default() {
-	local gw
+	local gw dev
 	gw=$(cat "$STATE_DIR/wan_gw" 2>/dev/null)
+	dev=$(cat "$STATE_DIR/wan_dev" 2>/dev/null)
 	[ -n "$gw" ] || gw=$(wan_gw)
-	[ -n "$gw" ] || gw=10.254.0.1
-	ip -4 route replace default via "$gw" dev eth1 2>/dev/null || true
+	[ -n "$dev" ] || dev=$(ip -4 route show default 2>/dev/null | awk '/via/ && $0 !~ /nsclient/ {for (i = 1; i <= NF; i++) if ($i == "dev") { print $(i + 1); exit }}')
+	[ -n "$gw" ] && [ -n "$dev" ] || return 0
+	ip -4 route replace default via "$gw" dev "$dev" 2>/dev/null || true
 }
 
 handshake_age() {
@@ -1252,6 +1312,7 @@ connect() {
 
 	set_region "$region"
 	set_want 1
+	apply_killswitch
 	clear_block
 	abort_exit_ip_fetch
 	bump_exit_ip_gen
@@ -1355,6 +1416,7 @@ disconnect() {
 		[ "$KEEP_BLOCK" = "1" ] || clear_block
 		[ "$KEEP_BLOCK" = "1" ] || clear_login_fail
 	fi
+	apply_killswitch
 	log "disconnected"
 	json_out '{"ok":true,"msg":"已断开"}'
 	write_status_cache &
@@ -1453,6 +1515,7 @@ watch_tick() {
 		[ "$enable" = "1" ] && set_want 1
 		if_up && set_want 1
 	fi
+	apply_killswitch
 
 	if account_expired "$(cached_expired_time)"; then
 		block_and_drop "账号已到期"
@@ -1695,7 +1758,21 @@ status_json() {
 	blocked=$(cat "$BLOCK_FILE" 2>/dev/null || true)
 	login_pending=false
 	login_result='{}'
-	[ -f "$LOGIN_JOB" ] && login_pending=true
+	if [ -f "$LOGIN_JOB" ]; then
+		job_ts=$(awk '{print $1; exit}' "$LOGIN_JOB" 2>/dev/null)
+		now=$(date +%s)
+		if ! [ "$job_ts" -gt 1000000000 ] 2>/dev/null; then
+			job_ts=$(date -r "$LOGIN_JOB" +%s 2>/dev/null || echo 0)
+		fi
+		if [ "$job_ts" -gt 0 ] 2>/dev/null && [ $((now - job_ts)) -gt 120 ]; then
+			rm -f "$LOGIN_JOB"
+			if [ ! -s "$LOGIN_RESULT" ]; then
+				printf '%s\n' '{"ok":false,"code":0,"msg":"登录超时"}' > "$LOGIN_RESULT"
+			fi
+		else
+			login_pending=true
+		fi
+	fi
 	if [ -s "$LOGIN_RESULT" ] && jq -e . "$LOGIN_RESULT" >/dev/null 2>&1; then
 		login_result=$(cat "$LOGIN_RESULT")
 	fi
@@ -1703,6 +1780,8 @@ status_json() {
 	case "$(uci_get split)" in
 		0|off|false|no) split=0 ;;
 	esac
+	killswitch=0
+	killswitch_enabled && killswitch=1
 	dns_mode=global
 	dns_china=""
 	dns_overseas=""
@@ -1786,6 +1865,7 @@ status_json() {
 		--argjson login_result "$login_result" \
 		--arg block_reason "${blocked:-}" \
 		--argjson split "$split" \
+		--argjson killswitch "$killswitch" \
 		--arg dns_mode "$dns_mode" \
 		--arg dns_china "$dns_china" \
 		--arg dns_overseas "$dns_overseas" \
@@ -1821,6 +1901,7 @@ status_json() {
 			login_result:$login_result,
 			block_reason:$block_reason,
 			split:$split,
+			killswitch:$killswitch,
 			dns_mode:$dns_mode,
 			dns_china:$dns_china,
 			dns_overseas:$dns_overseas,
@@ -1862,13 +1943,15 @@ Usage: nsclient <command> [args]
   watch
   routes
   sync
-  get orch|domain|account|region|enable|split
+  get orch|domain|account|region|enable|split|killswitch
   set orch <url>
   set domain <host>
   set account <user> [password]
   set region <region>
   set enable <0|1>
   set split <0|1>
+  set killswitch <0|1>
+  killswitch
 EOF
 }
 
@@ -1882,7 +1965,8 @@ case "$cmd" in
 	status) status_json ;;
 	autostart) run_locked autostart ;;
 	watch) watch_loop ;;
-	routes) apply_runtime_policy ;;
+	routes) run_locked apply_runtime_policy ;;
+	killswitch) apply_killswitch ;;
 	sync) sync_from_env ;;
 	get)
 		case "$1" in
@@ -1892,6 +1976,7 @@ case "$cmd" in
 			region) uci_get region; echo ;;
 			enable) uci_get enable; echo ;;
 			split) split_enabled && echo 1 || echo 0 ;;
+			killswitch) killswitch_enabled && echo 1 || echo 0 ;;
 			*) usage; exit 1 ;;
 		esac
 		;;
@@ -1903,6 +1988,7 @@ case "$cmd" in
 			region) set_region "$2" ;;
 			enable) set_enable "$2" ;;
 			split) set_split "$2" ;;
+			killswitch) set_killswitch "$2" ;;
 			*) usage; exit 1 ;;
 		esac
 		;;

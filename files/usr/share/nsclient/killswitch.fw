@@ -1,0 +1,3 @@
+#!/bin/sh
+# fw3 include: re-apply LAN kill switch after firewall reload.
+[ -x /usr/sbin/nsclient ] && /usr/sbin/nsclient killswitch >/dev/null 2>&1 || true

@@ -21,8 +21,10 @@ case "$INTERFACE" in
 		elif should_autostart; then
 			/usr/sbin/nsclient autostart >/dev/null 2>&1 &
 		fi
+		/usr/sbin/nsclient killswitch >/dev/null 2>&1 &
 		;;
 	nsclient)
 		/usr/sbin/nsclient routes >/dev/null 2>&1 &
+		/usr/sbin/nsclient killswitch >/dev/null 2>&1 &
 		;;
 esac

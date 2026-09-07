@@ -1,7 +1,7 @@
 include $(TOPDIR)/rules.mk
 
 PKG_NAME:=luci-app-nsclient
-PKG_VERSION:=2026090410
+PKG_VERSION:=2026090710
 PKG_RELEASE:=1
 
 PKG_BUILD_DIR:=$(BUILD_DIR)/$(PKG_NAME)
@@ -40,7 +40,9 @@ define Package/$(PKG_NAME)/install
 	$(CP) ./files/* $(1)/
 	chmod 0755 $(1)/usr/sbin/nsclient $(1)/etc/init.d/nsclient \
 		$(1)/etc/init.d/nsclient-boot \
-		$(1)/etc/hotplug.d/iface/99-nsclient
+		$(1)/etc/hotplug.d/iface/99-nsclient \
+		$(1)/usr/share/nsclient/killswitch.fw \
+		$(1)/etc/uci-defaults/98-nsclient-ks
 endef
 
 define Package/$(PKG_NAME)/postinst
@@ -48,6 +50,7 @@ define Package/$(PKG_NAME)/postinst
 	[ -n "$${IPKG_INSTROOT}" ] || {
 		/etc/init.d/nsclient enable >/dev/null 2>&1 || true
 		/etc/init.d/nsclient-boot enable >/dev/null 2>&1 || true
+		[ -f /etc/uci-defaults/98-nsclient-ks ] && . /etc/uci-defaults/98-nsclient-ks && rm -f /etc/uci-defaults/98-nsclient-ks
 		rm -rf /tmp/luci-indexcache /tmp/luci-modulecache >/dev/null 2>&1 || true
 	}
 	exit 0

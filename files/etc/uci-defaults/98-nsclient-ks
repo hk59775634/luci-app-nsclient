@@ -1,0 +1,11 @@
+#!/bin/sh
+uci -q get nsclient.main.killswitch >/dev/null || uci -q set nsclient.main.killswitch=0
+uci -q commit nsclient
+
+if ! uci -q get firewall.nsclient_ks.path >/dev/null; then
+	uci set firewall.nsclient_ks=include
+	uci set firewall.nsclient_ks.path=/usr/share/nsclient/killswitch.fw
+	uci set firewall.nsclient_ks.reload=1
+	uci commit firewall
+fi
+exit 0

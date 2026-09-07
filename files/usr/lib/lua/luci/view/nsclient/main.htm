@@ -145,6 +145,16 @@
 						<div class="nsc-hint">国内网站直连，海外走隧道（chnroutes）</div>
 					</div>
 				</div>
+				<div class="nsc-toggle">
+					<label class="nros-switch">
+						<input type="checkbox" id="nsc-killswitch" />
+						<span></span>
+					</label>
+					<div>
+						<div class="nsc-toggle__label">网络锁</div>
+						<div class="nsc-hint">开启后，只要你点了连接，局域网就不能走 WAN 直连（国内分流也会被拦住）。VPN 断开或重连时设备上不了网，避免流量泄漏。路由器管理页不受影响。默认关闭。</div>
+					</div>
+				</div>
 			</div>
 		</section>
 
@@ -225,6 +235,15 @@
 	function regionLabel(code) {
 		if (!code) return '';
 		return REGIONS[code] || String(code).toUpperCase();
+	}
+
+	function esc(s) {
+		return String(s == null ? '' : s)
+			.replace(/&/g, '&amp;')
+			.replace(/</g, '&lt;')
+			.replace(/>/g, '&gt;')
+			.replace(/"/g, '&quot;')
+			.replace(/'/g, '&#39;');
 	}
 
 	function displayAccount(s) {
@@ -341,9 +360,9 @@
 			else if (on && wait) badge = '<span class="nsc-badge nsc-badge-wait">握手中</span>';
 			else if (on) badge = '<span class="nsc-badge">当前</span>';
 			li.innerHTML =
-				'<input type="radio" name="nsc-region" value="' + (n.region || '') + '"' +
+				'<input type="radio" name="nsc-region" value="' + esc(n.region || '') + '"' +
 				((n.region === region) ? ' checked="checked"' : '') + ' />' +
-				'<span class="nsc-name">' + regionLabel(n.region) + '</span>' +
+				'<span class="nsc-name">' + esc(regionLabel(n.region)) + '</span>' +
 				badge;
 			(function(row) {
 				row.onclick = function(ev) {
@@ -372,7 +391,7 @@
 
 	function row(k, v) {
 		if (!v) return '';
-		return '<span class="nsc-k">' + k + '</span><span>' + v + '</span>';
+		return '<span class="nsc-k">' + esc(k) + '</span><span>' + esc(v) + '</span>';
 	}
 
 	function renderStatus(st) {
@@ -404,10 +423,11 @@
 			traffic = '↓ ' + bytes(st.rx) + '　↑ ' + bytes(st.tx);
 
 		box.className = 'nsc-status ' + cls;
-		box.innerHTML = '<div class="nsc-state">' + state + '</div><div class="nsc-rows">' +
+		box.innerHTML = '<div class="nsc-state">' + esc(state) + '</div><div class="nsc-rows">' +
 			row('账号', acc) +
 			row('区域', regionLabel(switchingTo || live)) +
 			row('模式', st.split ? '分流（国内直连）' : '全局') +
+			row('网络锁', st.killswitch ? '已开启' : '关闭') +
 			row('出口 IP', displayExitIp(st)) +
 			row('到期', st.expired_text || (accountSyncing ? '获取中…' : '')) +
 			row('流量', traffic) +
@@ -419,6 +439,7 @@
 		}
 		$('nsc-enable').checked = !!st.enable;
 		if ($('nsc-split')) $('nsc-split').checked = st.split !== 0 && st.split !== false;
+		if ($('nsc-killswitch')) $('nsc-killswitch').checked = st.killswitch === true || st.killswitch === 1 || st.killswitch === '1';
 		renderNodes(st.nodes, selectedRegion() || st.region, st);
 	}
 
@@ -724,6 +745,20 @@
 				setMsg((j && j.msg) || '保存失败', true);
 			}
 		});
+	};
+
+	$('nsc-killswitch').onchange = function() {
+		var on = this.checked;
+		setMsg(on ? '正在开启网络锁…' : '正在关闭网络锁…');
+		post(U_SAVE, { killswitch: on ? '1' : '0' }, function(j) {
+			if (j && j.ok) {
+				setMsg(on ? '已开启网络锁：VPN 未连通时局域网不能访问外网' : '已关闭网络锁');
+				refreshStatus();
+			} else {
+				this.checked = !on;
+				setMsg((j && j.msg) || '保存失败', true);
+			}
+		}.bind(this));
 	};
 
 	$('nsc-password').onkeydown = function(ev) {
