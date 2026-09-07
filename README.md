@@ -42,7 +42,7 @@ make package/luci-app-nsclient/compile V=s
 
 依赖：`curl`、`jq`、`wireguard-tools`、`kmod-wireguard`。
 
-登录时会先尝试 HTTPS；若本机旧版 wolfSSL/OpenSSL 1.1 无法与编排站完成握手，自动改走 HTTP。系统时间早于 2025 时会先用 NTP 校时。
+登录只走 HTTPS（`curl -k`，过期证书也可连）。不再降级到 HTTP。系统时间早于 2025 时会先用 NTP 校时。
 
 ## Release
 

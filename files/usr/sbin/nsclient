@@ -24,8 +24,9 @@ DEFAULT_ORCH=https://orch.one.netsignory.net
 WG_FWMARK=0xca6c
 WG_TABLE=51820
 WG_RULE_PREF=1004
-CHN_FALLBACK=/usr/share/nsclient/chnroutes-v4
+CHN_ORIG=/usr/share/nsclient/chnroutes-v4
 CHN_FILE=/etc/nsclient/chnroutes-v4
+HS_JOB="$STATE_DIR/hs.job"
 CHN_TABLE=51821
 CHN_RULE_PREF=1005
 CHN_DNS_FALLBACK=180.76.76.76
@@ -318,11 +319,12 @@ ks_clear() {
 }
 
 ks_ensure_cn_ipset() {
-	local stamp tmp
+	local stamp tmp chn
 	command -v ipset >/dev/null 2>&1 || return 1
 	split_enabled || return 1
 	ensure_chnroutes_file || return 1
-	stamp=$(md5sum "$CHN_FILE" 2>/dev/null | awk '{print $1}')
+	chn=$(chnroutes_active) || return 1
+	stamp=$(md5sum "$chn" 2>/dev/null | awk '{print $1}')
 	[ -n "$stamp" ] || return 1
 	if [ "$(cat "$STATE_DIR/ks_cn.stamp" 2>/dev/null)" = "$stamp" ] && \
 		ipset list nsc_cn >/dev/null 2>&1; then
@@ -331,7 +333,7 @@ ks_ensure_cn_ipset() {
 	tmp=/tmp/nsclient-cn.ipset
 	{
 		echo "create nsc_cn hash:net family inet hashsize 4096 maxelem 65536"
-		awk '/^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+\/[0-9]+$/{print "add nsc_cn " $1}' "$CHN_FILE"
+		awk '/^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+\/[0-9]+$/{print "add nsc_cn " $1}' "$chn"
 	} > "$tmp"
 	ipset destroy nsc_cn 2>/dev/null || true
 	if ! ipset restore < "$tmp"; then
@@ -357,23 +359,21 @@ apply_killswitch() {
 					if ks_ensure_cn_ipset; then
 						have_cn=1
 					else
-						log "leak-protect: split on but China set missing, not blocking WAN"
+						log "leak-protect: China set missing, blocking non-local like global"
 					fi
 				fi
-				if ! split_enabled || [ "$have_cn" = 1 ]; then
-					iptables -N nsc_ks 2>/dev/null || iptables -F nsc_ks
-					iptables -A nsc_ks -o "$IFNAME" -j RETURN
-					iptables -A nsc_ks -o "$lan" -j RETURN
-					for p in $(reserved_unicast) $(reserved_localonly); do
-						iptables -A nsc_ks -d "$p" -j RETURN
-					done
-					[ "$have_cn" = 1 ] && \
-						iptables -A nsc_ks -m set --match-set nsc_cn dst -j RETURN
-					iptables -A nsc_ks -j REJECT --reject-with icmp-net-prohibited
-					iptables -I FORWARD 1 -i "$lan" -j nsc_ks
-					mkdir_state
-					printf '%s' "$lan" > "$STATE_DIR/ks_lan"
-				fi
+				iptables -N nsc_ks 2>/dev/null || iptables -F nsc_ks
+				iptables -A nsc_ks -o "$IFNAME" -j RETURN
+				iptables -A nsc_ks -o "$lan" -j RETURN
+				for p in $(reserved_unicast) $(reserved_localonly); do
+					iptables -A nsc_ks -d "$p" -j RETURN
+				done
+				[ "$have_cn" = 1 ] && \
+					iptables -A nsc_ks -m set --match-set nsc_cn dst -j RETURN
+				iptables -A nsc_ks -j REJECT --reject-with icmp-net-prohibited
+				iptables -I FORWARD 1 -i "$lan" -j nsc_ks
+				mkdir_state
+				printf '%s' "$lan" > "$STATE_DIR/ks_lan"
 			fi
 		fi
 	fi
@@ -592,12 +592,21 @@ login() {
 	msg=$(printf '%s' "$resp" | jq -r '.msg // empty')
 	if [ "$code" != "200" ]; then
 		[ -n "$msg" ] || msg="登录失败"
-		# Periodic refresh: treat API business errors as disabled/revoked.
-		# A user typing the wrong password must not tear the tunnel down.
+		# Periodic refresh: only 401/403 mean the account is gone.
+		# 502/503/429 must not tear down a healthy tunnel.
+		# Interactive wrong password never drops the tunnel.
 		if [ "$NSC_REFRESH" = "1" ]; then
-			set_login_fail account
-			set_block "$msg"
-			rm -f "$LOGIN_JSON"
+			case "$code" in
+				401|403)
+					set_login_fail account
+					set_block "$msg"
+					rm -f "$LOGIN_JSON"
+					;;
+				*)
+					set_login_fail network
+					log "refresh ignored code=$code msg=$msg"
+					;;
+			esac
 		fi
 		login_finish "$(jq -nc --argjson c "$code" --arg m "$msg" '{ok:false,code:$c,msg:$m}')" 1
 		return 1
@@ -864,7 +873,7 @@ curl_post_json() {
 			return $?
 			;;
 	esac
-	curl_one "$url" "$body" 15
+	return 1
 }
 
 wan_dev() {
@@ -969,17 +978,22 @@ chnroutes_valid() {
 	[ "$n" -ge 100 ] 2>/dev/null
 }
 
-ensure_chnroutes_file() {
-	mkdir -p /etc/nsclient
+# Runtime file is updated in place. Packaged original is never overwritten.
+chnroutes_active() {
 	if chnroutes_valid "$CHN_FILE"; then
+		printf '%s' "$CHN_FILE"
 		return 0
 	fi
-	if chnroutes_valid "$CHN_FALLBACK"; then
-		cp "$CHN_FALLBACK" "$CHN_FILE" 2>/dev/null || return 1
-		log "chnroutes using bundled fallback ($(chnroutes_count "$CHN_FILE") prefixes)"
+	if chnroutes_valid "$CHN_ORIG"; then
+		printf '%s' "$CHN_ORIG"
 		return 0
 	fi
 	return 1
+}
+
+ensure_chnroutes_file() {
+	mkdir -p /etc/nsclient
+	chnroutes_active >/dev/null
 }
 
 china_dns() {
@@ -1027,16 +1041,16 @@ clear_split_routes() {
 }
 
 apply_split_routes() {
-	local gw dev batch stamp cur
+	local gw dev batch stamp cur chn
 	split_enabled || { clear_split_routes; return 0; }
-	ensure_chnroutes_file || { log "chnroutes file missing"; return 1; }
+	chn=$(chnroutes_active) || { log "chnroutes file missing"; return 1; }
 	gw=$(trim "$1")
 	dev=$(wan_dev)
 	[ -n "$gw" ] || gw=$(wan_gw)
 	[ -n "$gw" ] || return 1
 	[ -n "$dev" ] || return 1
 	ensure_chn_rule
-	stamp=$(md5sum "$CHN_FILE" 2>/dev/null | awk '{print $1}')
+	stamp=$(md5sum "$chn" 2>/dev/null | awk '{print $1}')
 	stamp="${stamp}_${gw}_${dev}"
 	cur=$(cat "$STATE_DIR/chn_routes.stamp" 2>/dev/null)
 	if [ "$stamp" = "$cur" ]; then
@@ -1046,7 +1060,7 @@ apply_split_routes() {
 	awk -v gw="$gw" -v dev="$dev" -v tid="$CHN_TABLE" '
 		/^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+\/[0-9]+$/ {
 			printf "route replace %s via %s dev %s table %s\n", $1, gw, dev, tid
-		}' "$CHN_FILE" > "$batch"
+		}' "$chn" > "$batch"
 	ip route flush table "$CHN_TABLE" 2>/dev/null || true
 	ip -batch "$batch" 2>/dev/null || {
 		log "chnroutes ip -batch failed"
@@ -1054,7 +1068,7 @@ apply_split_routes() {
 	}
 	mkdir_state
 	echo "$stamp" > "$STATE_DIR/chn_routes.stamp"
-	log "chnroutes applied $(chnroutes_count "$CHN_FILE") prefixes via $gw dev $dev"
+	log "chnroutes applied $(chnroutes_count "$chn") prefixes via $gw dev $dev"
 }
 
 chnroutes_fetch_urls() {
@@ -1103,7 +1117,7 @@ fetch_chnroutes() {
 		rm -f "$tmp"
 	done
 	ensure_chnroutes_file
-	log "chnroutes fetch failed, using $(chnroutes_valid "$CHN_FILE" && echo local || echo none)"
+	log "chnroutes fetch failed, using $(chnroutes_active >/dev/null && echo fallback || echo none)"
 	return 1
 }
 
@@ -1162,13 +1176,14 @@ strip_dhcp_nsclient_dns() {
 }
 
 dns_fingerprint() {
-	local chn
-	chn=$(md5sum "$CHN_FILE" 2>/dev/null | awk '{print $1}')
+	local chn chnf
+	chn=$(chnroutes_active) 2>/dev/null || chn=""
+	chnf=$(md5sum "$chn" 2>/dev/null | awk '{print $1}')
 	if leakprotect_active && split_enabled && dnsmasq_supports_chnroutes; then
 		if if_up; then
-			printf 'leak-split-up %s %s %s' "$(china_dns)" "$(overseas_dns)" "$chn"
+			printf 'leak-split-up %s %s %s' "$(china_dns)" "$(overseas_dns)" "$chnf"
 		else
-			printf 'leak-split-down %s %s' "$(china_dns)" "$chn"
+			printf 'leak-split-down %s %s' "$(china_dns)" "$chnf"
 		fi
 	elif leakprotect_active; then
 		if if_up; then
@@ -1178,7 +1193,7 @@ dns_fingerprint() {
 			printf 'leak-down'
 		fi
 	elif split_enabled && if_up && dnsmasq_supports_chnroutes; then
-		printf 'split %s %s %s' "$(china_dns)" "$(overseas_dns)" "$chn"
+		printf 'split %s %s %s' "$(china_dns)" "$(overseas_dns)" "$chnf"
 	else
 		printf 'global '
 		upstream_dns_list | awk 'NF' | sort -u | tr '\n' ' '
@@ -1202,7 +1217,7 @@ dnsmasq_apply() {
 }
 
 apply_upstream_dns() {
-	local d sec conf fp local_d remote_d how
+	local d sec conf fp local_d remote_d how chn
 	sec=$(dns_section) || sec='@dnsmasq[0]'
 	conf=/tmp/dnsmasq.d/nsclient.conf
 	fp=$(dns_fingerprint)
@@ -1211,8 +1226,9 @@ apply_upstream_dns() {
 	fi
 	mkdir -p /tmp/dnsmasq.d "$STATE_DIR"
 	strip_dhcp_nsclient_dns
+	chn=$(chnroutes_active) 2>/dev/null || chn=""
 
-	if leakprotect_active && split_enabled && dnsmasq_supports_chnroutes && ensure_chnroutes_file; then
+	if leakprotect_active && split_enabled && dnsmasq_supports_chnroutes && [ -n "$chn" ]; then
 		local_d=$(china_dns)
 		: > /tmp/resolv.conf.auto
 		if if_up; then
@@ -1223,7 +1239,7 @@ no-resolv
 all-servers
 server=${local_d},0
 server=${remote_d},1
-chnroutes-file=${CHN_FILE}
+chnroutes-file=${chn}
 EOF
 			log "dns leak-protect split china=${local_d} overseas=${remote_d}"
 		else
@@ -1231,7 +1247,7 @@ EOF
 # nsclient split DNS + leak protect: tunnel down, China only
 no-resolv
 server=${local_d},0
-chnroutes-file=${CHN_FILE}
+chnroutes-file=${chn}
 EOF
 			log "dns leak-protect split china-only (tunnel down)"
 		fi
@@ -1272,7 +1288,7 @@ EOF
 				;;
 		esac
 		return 0
-	elif split_enabled && if_up && dnsmasq_supports_chnroutes && ensure_chnroutes_file; then
+	elif split_enabled && if_up && dnsmasq_supports_chnroutes && [ -n "$chn" ]; then
 		local_d=$(china_dns)
 		remote_d=$(overseas_dns)
 		: > /tmp/resolv.conf.auto
@@ -1282,7 +1298,7 @@ no-resolv
 all-servers
 server=${local_d},0
 server=${remote_d},1
-chnroutes-file=${CHN_FILE}
+chnroutes-file=${chn}
 EOF
 		how=restart
 		log "dns split china=${local_d} overseas=${remote_d}"
@@ -1402,7 +1418,7 @@ handshake_age() {
 }
 
 connect() {
-	local region tun priv addr sip sport spub dns peer_name gw fail msg
+	local region tun priv addr sip sport spub dns peer_name gw fail msg cg
 	region=$(normalize_region "${1:-$(uci_get region)}") || region=""
 
 	# Always login so login_status / expiry / disable are checked before
@@ -1448,6 +1464,7 @@ connect() {
 	set_want 1
 	apply_killswitch
 	clear_block
+	abort_hs_job
 	abort_exit_ip_fetch
 	bump_exit_ip_gen
 	save_wan_default
@@ -1509,26 +1526,35 @@ connect() {
 	rm -f "$EXIT_IP_FILE"
 	write_status_cache &
 
+	cg=$(exit_ip_gen)
 	(
+		echo $$ > "$HS_JOB"
 		if ! wait_handshake; then
+			[ "$(exit_ip_gen)" = "$cg" ] && wanted || exit 0
 			log "no handshake, bounce after re-pin"
 			pin_host_via_wan "$sip" "$gw"
 			ensure_wg_mark_table "$gw"
 			flush_wg_conntrack
 			ifdown "$IFNAME" >/dev/null 2>&1 || true
 			sleep 1
+			[ "$(exit_ip_gen)" = "$cg" ] && wanted || exit 0
 			ifup "$IFNAME"
 			wait_if_up || true
+			[ "$(exit_ip_gen)" = "$cg" ] && wanted || exit 0
 			apply_runtime_policy
 			wait_handshake || log "handshake still pending endpoint=${sip}:${sport}"
 		fi
+		[ "$(exit_ip_gen)" = "$cg" ] && wanted || exit 0
 		fetch_exit_ip
 		write_status_cache
+		[ "$(exit_ip_gen)" = "$cg" ] && wanted || exit 0
 		apply_runtime_policy
+		rm -f "$HS_JOB"
 	) >/dev/null 2>&1 &
 }
 
 disconnect() {
+	abort_hs_job
 	ifdown "$IFNAME" >/dev/null 2>&1 || true
 	ip link del dev "$IFNAME" >/dev/null 2>&1 || true
 	flush_wg_conntrack
@@ -1640,14 +1666,17 @@ refresh_account() {
 }
 
 watch_tick() {
-	local first="$1" enable age miss region login_age
+	local first="$1" enable age miss region login_age want
 
 	enable=$(uci_get enable)
 	[ -n "$enable" ] || enable=0
 
 	if [ "$first" = "1" ]; then
-		[ "$enable" = "1" ] && set_want 1
-		if_up && set_want 1
+		want=$(uci_get want)
+		if [ -z "$want" ]; then
+			[ "$enable" = "1" ] && set_want 1
+			if_up && set_want 1
+		fi
 	fi
 	apply_killswitch
 
@@ -1767,6 +1796,16 @@ bump_exit_ip_gen() {
 	rm -f "$EXIT_IP_FILE"
 }
 
+abort_hs_job() {
+	local pid
+	pid=$(cat "$HS_JOB" 2>/dev/null)
+	if [ -n "$pid" ]; then
+		kill "$pid" 2>/dev/null || true
+		kill -9 "$pid" 2>/dev/null || true
+	fi
+	rm -f "$HS_JOB"
+}
+
 abort_exit_ip_fetch() {
 	local pid
 	pid=$(cat "$STATE_DIR/exit_ip.pid" 2>/dev/null)
@@ -1875,7 +1914,7 @@ status_json() {
 	local expired expired_text login_account groupname login_status
 	local nodes endpoint private_ip peer_name exit_ip exit_ip_region live_region
 	local _eip _ereg _ets _eaddr _egen
-	local split dns_mode dns_china dns_overseas chn_count
+	local split dns_mode dns_china dns_overseas chn_count chn
 	local want blocked login_pending login_result
 
 	orch=$(orch_url)
@@ -1924,10 +1963,8 @@ status_json() {
 		dns_mode=split
 		dns_china=$(china_dns)
 		dns_overseas=$(overseas_dns)
-		chnroutes_valid "$CHN_FILE" && chn_count=$(chnroutes_count "$CHN_FILE")
-		[ "$chn_count" -gt 0 ] 2>/dev/null || {
-			chnroutes_valid "$CHN_FALLBACK" && chn_count=$(chnroutes_count "$CHN_FALLBACK")
-		}
+		chn=$(chnroutes_active) 2>/dev/null || chn=""
+		[ -n "$chn" ] && chn_count=$(chnroutes_count "$chn")
 	fi
 
 	connected=false
