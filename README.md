@@ -60,6 +60,13 @@ https://github.com/hk59775634/luci-app-nsclient/releases
 
 路由器 **更新** 页会检测 latest release，可单独更新 NS Client 或整包固件。
 
+更新说明只维护一份，文件是仓库根目录的 `RELEASE_NOTES`。打 Release 时必须：
+
+- `manifest.json` 的 `notes` 原样写入该文件内容
+- `gh release create --notes-file RELEASE_NOTES`
+
+不要另写英文短句或另一份中文。检查更新无论走到清单还是 GitHub API，页面都应显示同一段文字。
+
 ## 分流
 
 默认 **分流**：中国大陆 IP（[chnroutes](https://github.com/hk59775634/chnroutes) IPv4）走 WAN，其余走隧道。可改为 **全局**（全部公网走隧道）。
