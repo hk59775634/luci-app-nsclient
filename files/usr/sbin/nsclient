@@ -274,6 +274,11 @@ killswitch_enabled() {
 	esac
 }
 
+# UCI key stays killswitch. Active only while the user wants a VPN session.
+leakprotect_active() {
+	killswitch_enabled && wanted
+}
+
 set_killswitch() {
 	ensure_uci
 	case "$1" in
@@ -281,7 +286,11 @@ set_killswitch() {
 		*) uci_set killswitch 0 ;;
 	esac
 	uci commit "$UCI_PKG"
-	apply_killswitch
+	if if_up; then
+		apply_runtime_policy
+	else
+		apply_killswitch
+	fi
 	write_status_cache &
 }
 
@@ -308,20 +317,67 @@ ks_clear() {
 	rm -f "$STATE_DIR/ks_lan"
 }
 
-apply_killswitch() {
-	local lan
-	command -v iptables >/dev/null 2>&1 || return 0
-	ks_clear
-	killswitch_enabled || return 0
-	wanted || return 0
-	lan=$(lan_dev)
-	[ -n "$lan" ] || return 0
-	iptables -N nsc_ks 2>/dev/null || iptables -F nsc_ks
-	iptables -A nsc_ks -o "$IFNAME" -j RETURN
-	iptables -A nsc_ks -j REJECT --reject-with icmp-net-prohibited
-	iptables -I FORWARD 1 -i "$lan" -j nsc_ks
+ks_ensure_cn_ipset() {
+	local stamp tmp
+	command -v ipset >/dev/null 2>&1 || return 1
+	split_enabled || return 1
+	ensure_chnroutes_file || return 1
+	stamp=$(md5sum "$CHN_FILE" 2>/dev/null | awk '{print $1}')
+	[ -n "$stamp" ] || return 1
+	if [ "$(cat "$STATE_DIR/ks_cn.stamp" 2>/dev/null)" = "$stamp" ] && \
+		ipset list nsc_cn >/dev/null 2>&1; then
+		return 0
+	fi
+	tmp=/tmp/nsclient-cn.ipset
+	{
+		echo "create nsc_cn hash:net family inet hashsize 4096 maxelem 65536"
+		awk '/^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+\/[0-9]+$/{print "add nsc_cn " $1}' "$CHN_FILE"
+	} > "$tmp"
+	ipset destroy nsc_cn 2>/dev/null || true
+	if ! ipset restore < "$tmp"; then
+		rm -f "$tmp"
+		log "leak-protect: ipset restore failed"
+		return 1
+	fi
+	rm -f "$tmp"
 	mkdir_state
-	printf '%s' "$lan" > "$STATE_DIR/ks_lan"
+	printf '%s' "$stamp" > "$STATE_DIR/ks_cn.stamp"
+	return 0
+}
+
+apply_killswitch() {
+	local lan p have_cn
+	if command -v iptables >/dev/null 2>&1; then
+		ks_clear
+		if leakprotect_active; then
+			lan=$(lan_dev)
+			if [ -n "$lan" ]; then
+				have_cn=0
+				if split_enabled; then
+					if ks_ensure_cn_ipset; then
+						have_cn=1
+					else
+						log "leak-protect: split on but China set missing, not blocking WAN"
+					fi
+				fi
+				if ! split_enabled || [ "$have_cn" = 1 ]; then
+					iptables -N nsc_ks 2>/dev/null || iptables -F nsc_ks
+					iptables -A nsc_ks -o "$IFNAME" -j RETURN
+					iptables -A nsc_ks -o "$lan" -j RETURN
+					for p in $(reserved_unicast) $(reserved_localonly); do
+						iptables -A nsc_ks -d "$p" -j RETURN
+					done
+					[ "$have_cn" = 1 ] && \
+						iptables -A nsc_ks -m set --match-set nsc_cn dst -j RETURN
+					iptables -A nsc_ks -j REJECT --reject-with icmp-net-prohibited
+					iptables -I FORWARD 1 -i "$lan" -j nsc_ks
+					mkdir_state
+					printf '%s' "$lan" > "$STATE_DIR/ks_lan"
+				fi
+			fi
+		fi
+	fi
+	apply_upstream_dns
 }
 
 mkdir_state() {
@@ -1059,7 +1115,11 @@ maybe_update_chnroutes() {
 		echo $$ > "$STATE_DIR/chn_fetch.pid"
 		if fetch_chnroutes; then
 			if_up && apply_split_routes "$(wan_gw)"
-			if_up && apply_upstream_dns
+			if leakprotect_active; then
+				apply_killswitch
+			elif if_up; then
+				apply_upstream_dns
+			fi
 		fi
 		rm -f "$STATE_DIR/chn_fetch.pid"
 	) >/dev/null 2>&1 &
@@ -1102,9 +1162,23 @@ strip_dhcp_nsclient_dns() {
 }
 
 dns_fingerprint() {
-	if split_enabled && if_up && dnsmasq_supports_chnroutes; then
-		printf 'split %s %s %s' "$(china_dns)" "$(overseas_dns)" \
-			"$(md5sum "$CHN_FILE" 2>/dev/null | awk '{print $1}')"
+	local chn
+	chn=$(md5sum "$CHN_FILE" 2>/dev/null | awk '{print $1}')
+	if leakprotect_active && split_enabled && dnsmasq_supports_chnroutes; then
+		if if_up; then
+			printf 'leak-split-up %s %s %s' "$(china_dns)" "$(overseas_dns)" "$chn"
+		else
+			printf 'leak-split-down %s %s' "$(china_dns)" "$chn"
+		fi
+	elif leakprotect_active; then
+		if if_up; then
+			printf 'leak-up '
+			upstream_dns_list | awk 'NF' | sort -u | tr '\n' ' '
+		else
+			printf 'leak-down'
+		fi
+	elif split_enabled && if_up && dnsmasq_supports_chnroutes; then
+		printf 'split %s %s %s' "$(china_dns)" "$(overseas_dns)" "$chn"
 	else
 		printf 'global '
 		upstream_dns_list | awk 'NF' | sort -u | tr '\n' ' '
@@ -1138,7 +1212,67 @@ apply_upstream_dns() {
 	mkdir -p /tmp/dnsmasq.d "$STATE_DIR"
 	strip_dhcp_nsclient_dns
 
-	if split_enabled && if_up && dnsmasq_supports_chnroutes && ensure_chnroutes_file; then
+	if leakprotect_active && split_enabled && dnsmasq_supports_chnroutes && ensure_chnroutes_file; then
+		local_d=$(china_dns)
+		: > /tmp/resolv.conf.auto
+		if if_up; then
+			remote_d=$(overseas_dns)
+			cat > "$conf" <<EOF
+# nsclient split DNS + leak protect
+no-resolv
+all-servers
+server=${local_d},0
+server=${remote_d},1
+chnroutes-file=${CHN_FILE}
+EOF
+			log "dns leak-protect split china=${local_d} overseas=${remote_d}"
+		else
+			cat > "$conf" <<EOF
+# nsclient split DNS + leak protect: tunnel down, China only
+no-resolv
+server=${local_d},0
+chnroutes-file=${CHN_FILE}
+EOF
+			log "dns leak-protect split china-only (tunnel down)"
+		fi
+		how=restart
+	elif leakprotect_active && ! if_up; then
+		: > /tmp/resolv.conf.auto
+		cat > "$conf" <<EOF
+# nsclient leak protect: global mode, no WAN DNS while the tunnel is down
+no-resolv
+EOF
+		how=restart
+		log "dns leak-protect fail-closed"
+	elif leakprotect_active && if_up; then
+		: > "$conf"
+		: > /tmp/resolv.conf.auto
+		for d in $(upstream_dns_list); do
+			d=$(trim "$d")
+			case "$d" in
+				[0-9]*.[0-9]*.[0-9]*.[0-9]*)
+					echo "nameserver $d" >> /tmp/resolv.conf.auto
+					echo "server=$d" >> "$conf"
+					uci -q add_list "dhcp.${sec}.server=$d"
+					;;
+			esac
+		done
+		if [ ! -s /tmp/resolv.conf.auto ]; then
+			cat > "$conf" <<EOF
+# nsclient leak protect: tunnel up but no VPN DNS yet
+no-resolv
+EOF
+		fi
+		how=restart
+		log "dns leak-protect tunnel-only"
+	elif ! if_up; then
+		case "$(cat "$STATE_DIR/dns_fp" 2>/dev/null)" in
+			leak-*)
+				clear_upstream_dns
+				;;
+		esac
+		return 0
+	elif split_enabled && if_up && dnsmasq_supports_chnroutes && ensure_chnroutes_file; then
 		local_d=$(china_dns)
 		remote_d=$(overseas_dns)
 		: > /tmp/resolv.conf.auto

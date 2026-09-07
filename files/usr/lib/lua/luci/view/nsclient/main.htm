@@ -151,8 +151,8 @@
 						<span></span>
 					</label>
 					<div>
-						<div class="nsc-toggle__label">网络锁</div>
-						<div class="nsc-hint">开启后，只要你点了连接，局域网就不能走 WAN 直连（国内分流也会被拦住）。VPN 断开或重连时设备上不了网，避免流量泄漏。路由器管理页不受影响。默认关闭。</div>
+						<div class="nsc-toggle__label">VPN 防泄露</div>
+						<div class="nsc-hint">VPN 防泄露功能用于防止设备在 VPN 连接异常、网络切换、VPN 重连或配置错误时，将真实的公网 IP、DNS 请求或其他网络流量暴露到 VPN 隧道之外。局域网始终走本地。全局模式下本地流量不受影响；分流模式下国内直连不受影响。仅对应当走 VPN 的流量生效。已点连接时生效；点断开后恢复。默认关闭。</div>
 					</div>
 				</div>
 			</div>
@@ -427,7 +427,7 @@
 			row('账号', acc) +
 			row('区域', regionLabel(switchingTo || live)) +
 			row('模式', st.split ? '分流（国内直连）' : '全局') +
-			row('网络锁', st.killswitch ? '已开启' : '关闭') +
+			row('VPN 防泄露', st.killswitch ? '已开启' : '关闭') +
 			row('出口 IP', displayExitIp(st)) +
 			row('到期', st.expired_text || (accountSyncing ? '获取中…' : '')) +
 			row('流量', traffic) +
@@ -749,10 +749,10 @@
 
 	$('nsc-killswitch').onchange = function() {
 		var on = this.checked;
-		setMsg(on ? '正在开启网络锁…' : '正在关闭网络锁…');
+		setMsg(on ? '正在开启 VPN 防泄露…' : '正在关闭 VPN 防泄露…');
 		post(U_SAVE, { killswitch: on ? '1' : '0' }, function(j) {
 			if (j && j.ok) {
-				setMsg(on ? '已开启网络锁：VPN 未连通时局域网不能访问外网' : '已关闭网络锁');
+				setMsg(on ? '已开启 VPN 防泄露' : '已关闭 VPN 防泄露');
 				refreshStatus();
 			} else {
 				this.checked = !on;

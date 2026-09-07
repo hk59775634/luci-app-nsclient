@@ -1,7 +1,7 @@
 include $(TOPDIR)/rules.mk
 
 PKG_NAME:=luci-app-nsclient
-PKG_VERSION:=2026090710
+PKG_VERSION:=2026090711
 PKG_RELEASE:=1
 
 PKG_BUILD_DIR:=$(BUILD_DIR)/$(PKG_NAME)
@@ -14,7 +14,7 @@ define Package/$(PKG_NAME)
 	SUBMENU:=3. Applications
 	TITLE:=NS Client — Netsignory WireGuard exit nodes
 	PKGARCH:=all
-	DEPENDS:=+curl +jq +wireguard-tools +kmod-wireguard
+	DEPENDS:=+curl +jq +wireguard-tools +kmod-wireguard +ipset +kmod-ipt-ipset
 endef
 
 define Package/$(PKG_NAME)/description
